@@ -1,0 +1,4 @@
+node_modules/
+*.log
+*.log.[0-9]
+/tmp/

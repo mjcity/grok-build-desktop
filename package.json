@@ -1,0 +1,15 @@
+{
+  "name": "grok-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Hermes-Desktop-compatible gateway that drives the Grok 4.5 CLI",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node server.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  }
+}

@@ -56,7 +56,7 @@ Hermes's protocol on one side and drives your real `grok` CLI on the other.
 | 🧬 **Self-improvement** | Grok remembers durable facts across sessions, and reflects on genuinely hard tasks in the background. See [below](#self-improvement). |
 | 🩹 **Self-healing gateway** | A supervisor restarts a crashed backend; a stall watchdog recovers a hung turn instead of leaving you staring at "running" forever. |
 | 🪪 **Its own identity** | Grok Build runs as a separately-named, separately-iconed app — its own taskbar button, icon, and window title, never merged with a stock Hermes install running beside it. |
-| 🖱️ **Real desktop control** | A local MCP server gives Grok screenshot/click/type/scroll/drag tools backed by ByteDance UI-TARS's `nut-js` operator — Grok's own vision decides what to click, no separate GUI-agent model required. See [`computer-use-mcp/`](computer-use-mcp/). |
+| 🖱️ **Real desktop control** | 50 tools — screenshot, click, type, scroll, drag, background/minimized-window control, accessibility tree, browser automation — via [cua-driver](https://github.com/trycua/cua) (MIT). A visible agent-cursor overlay shows what Grok is doing without ever touching your real mouse or keyboard focus. One-time install, see below. |
 
 ## 💰 CLI subscription vs. API token — why this matters
 
@@ -198,6 +198,35 @@ The prompt is deliberately verification-first: your agent has to *prove*
 the wiring with the repo's own exit-code-gated tests, not just claim success.
 
 </details>
+
+### 🖱️ Enabling real desktop control (optional)
+
+Grok's screenshot/click/type/scroll tools need [cua-driver](https://github.com/trycua/cua)
+installed once:
+
+```powershell
+irm https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.ps1 | iex
+```
+
+Then add this to `~/.grok/config.toml`:
+
+```toml
+[mcp_servers.cua_driver]
+command = 'C:\Users\<you>\AppData\Local\Programs\Cua\cua-driver\bin\cua-driver.exe'
+args = ['mcp']
+enabled = true
+```
+
+`GrokBuild.cmd` auto-starts the driver's background daemon on every launch if
+it finds the binary installed — nothing else to configure. Skip this
+entirely and everything else still works; Grok just won't have desktop
+control tools available. Disable the auto-start with
+`GROK_BUILD_NO_CUA_DRIVER=1`.
+
+By default cua-driver's telemetry is **enabled** (it's a separate project
+with its own policy, not something this repo controls) — disable it
+yourself if you'd rather not: `cua-driver telemetry disable` (and
+`cua-driver telemetry reset-id` to also erase the installation id).
 
 ## ✅ Verifying an install
 

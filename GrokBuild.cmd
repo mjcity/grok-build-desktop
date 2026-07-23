@@ -18,9 +18,10 @@ rem    GROK_BUILD_NO_PLAYWRIGHT  set to 1 to skip auto-starting the Playwright
 rem                          MCP server Grok's config expects on 127.0.0.1:8931
 rem    GROK_BUILD_PLAYWRIGHT_PS1  override the Playwright MCP starter script
 rem    GROK_BUILD_PLAYWRIGHT_DIR  Playwright profile/log dir (default: tmp\playwright next to this repo)
-rem    GROK_BUILD_NO_COMPUTER_USE  set to 1 to skip auto-starting the
-rem                          computer-use MCP server (screenshot/click/type)
-rem    GROK_BUILD_COMPUTER_USE_DIR  override the computer-use-mcp/ folder path
+rem    GROK_BUILD_NO_CUA_DRIVER  set to 1 to skip auto-starting the cua-driver
+rem                          daemon (real desktop control: screenshot/click/
+rem                          type/scroll/UIA). Install once from README.
+rem    GROK_BUILD_CUA_DRIVER_EXE  override the cua-driver.exe path
 rem ============================================================
 
 if not defined GROK_BUILD_PORT set "GROK_BUILD_PORT=8787"
@@ -132,49 +133,48 @@ if errorlevel 1 (
 )
 :playwright_done
 
-rem --- 1c) Computer-use MCP: screenshot/click/type/scroll as real desktop control ---
-rem Custom MCP server in computer-use-mcp/ - wraps @ui-tars/operator-nut-js as
-rem plain "hands" (screenshot+execute, no UI-TARS model/GUIAgent involved).
-rem Grok itself (vision-capable) looks at the screenshot tool's image and
-rem decides pixel coordinates; this server just executes them. See
-rem computer-use-mcp/server.mjs header comment for the full research trail on
-rem why this shape (no ready-made MCP server exists upstream in UI-TARS-desktop).
-rem   GROK_BUILD_NO_COMPUTER_USE=1   skip entirely
-rem   GROK_BUILD_COMPUTER_USE_DIR    override the computer-use-mcp/ folder path
-if "%GROK_BUILD_NO_COMPUTER_USE%"=="1" goto computer_use_done
-set "CU_DIR=%GROK_BUILD_COMPUTER_USE_DIR%"
-if not defined CU_DIR set "CU_DIR=%GATEWAY_DIR%computer-use-mcp"
-if not exist "%CU_DIR%\server.mjs" (
-  echo %date% %time% launcher: no computer-use-mcp at %CU_DIR% - skipping >> "%BOOT_LOG%"
-  goto computer_use_done
+rem --- 1c) cua-driver - real desktop control: screenshot/click/type/scroll/UIA ---
+rem Grok's config.toml points mcp_servers.cua_driver at a STDIO command, so
+rem grok.exe spawns the MCP proxy itself per-session - we only need to ensure
+rem the long-lived cua-driver SERVE DAEMON is running first. Without it,
+rem every cua_driver tool call fails. Same idempotent ensure-running pattern
+rem as Playwright. cua-driver is a separate, real open-source project -
+rem github.com/trycua/cua, MIT, 20k+ stars - not bundled here; install once
+rem with the official installer, see README.
+rem This superseded our own custom computer-use-mcp - the nut-js-based one -
+rem on 2026-07-23: cua-driver doesn't steal the real cursor or keyboard,
+rem using a visible agent-cursor overlay instead; it works on background and
+rem minimized windows; it offers accessibility-tree and browser-CDP tools
+rem our build never had; and it is a maintained upstream instead of code we
+rem would have to keep fixing ourselves.
+rem   GROK_BUILD_NO_CUA_DRIVER=1     skip entirely
+rem   GROK_BUILD_CUA_DRIVER_EXE      override the cua-driver.exe path
+if "%GROK_BUILD_NO_CUA_DRIVER%"=="1" goto cua_driver_done
+set "CUA_EXE=%GROK_BUILD_CUA_DRIVER_EXE%"
+if not defined CUA_EXE set "CUA_EXE=%LOCALAPPDATA%\Programs\Cua\cua-driver\bin\cua-driver.exe"
+if not exist "%CUA_EXE%" (
+  echo %date% %time% launcher: cua-driver not installed at %CUA_EXE% - real desktop control unavailable this session, see README for the one-time installer >> "%BOOT_LOG%"
+  goto cua_driver_done
 )
-if not exist "%CU_DIR%\node_modules" (
-  echo %date% %time% launcher: installing computer-use-mcp deps (first run) >> "%BOOT_LOG%"
-  pushd "%CU_DIR%"
-  cmd /c "npm install" >> "%BOOT_LOG%" 2>&1
-  popd
-)
-"%SystemRoot%\System32\netstat.exe" -ano | "%SYSFINDSTR%" /C:":8932" | "%SYSFINDSTR%" /C:"LISTENING" >nul 2>nul
+"%CUA_EXE%" status >nul 2>nul
 if not errorlevel 1 (
-  echo %date% %time% launcher: computer-use MCP already listening on 8932 >> "%BOOT_LOG%"
-  goto computer_use_done
+  echo %date% %time% launcher: cua-driver daemon already running >> "%BOOT_LOG%"
+  goto cua_driver_done
 )
-echo %date% %time% launcher: starting computer-use MCP on 8932 >> "%BOOT_LOG%"
-set "CU_OUT=%LOG_DIR%\computer-use-mcp-out.log"
-set "CU_ERR=%LOG_DIR%\computer-use-mcp-err.log"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%NODE_EXE%' -ArgumentList 'server.mjs' -WorkingDirectory '%CU_DIR%' -WindowStyle Hidden -RedirectStandardOutput '%CU_OUT%' -RedirectStandardError '%CU_ERR%'"
-set /a cu_tries=0
-:wait_computer_use
-set /a cu_tries+=1
-if %cu_tries% gtr 20 (
-  echo %date% %time% launcher: WARN computer-use MCP did not bind 8932 in time - continuing without it >> "%BOOT_LOG%"
-  goto computer_use_done
+echo %date% %time% launcher: starting cua-driver daemon >> "%BOOT_LOG%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%CUA_EXE%' -ArgumentList 'serve' -WindowStyle Hidden"
+set /a cua_tries=0
+:wait_cua_driver
+set /a cua_tries+=1
+if %cua_tries% gtr 20 (
+  echo %date% %time% launcher: WARN cua-driver daemon did not come up in time - continuing without it >> "%BOOT_LOG%"
+  goto cua_driver_done
 )
 "%SystemRoot%\System32\ping.exe" -n 2 127.0.0.1 >nul
-"%SystemRoot%\System32\netstat.exe" -ano | "%SYSFINDSTR%" /C:":8932" | "%SYSFINDSTR%" /C:"LISTENING" >nul 2>nul
-if errorlevel 1 goto wait_computer_use
-echo %date% %time% launcher: computer-use MCP ready >> "%BOOT_LOG%"
-:computer_use_done
+"%CUA_EXE%" status >nul 2>nul
+if errorlevel 1 goto wait_cua_driver
+echo %date% %time% launcher: cua-driver daemon ready >> "%BOOT_LOG%"
+:cua_driver_done
 
 rem --- 2) repair window-state.json only if missing/corrupt ---
 "%NODE_EXE%" "%GATEWAY_DIR%repair-window-state.mjs" "%PROFILE_DIR%\window-state.json" >> "%BOOT_LOG%" 2>nul

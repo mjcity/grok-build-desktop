@@ -72,6 +72,30 @@ $argList = @(
   "--viewport-size", "1280x800"
 )
 
+# CRITICAL for cross-turn persistence: disable @playwright/mcp's session
+# heartbeat by setting its ping timeout to 0.
+#
+# @playwright/mcp starts a heartbeat that pings the client every ~3s and
+# expects a pong within 5s, then calls server.close() (tearing down the
+# browser + all tab state) if none arrives. That design assumes a persistent
+# bidirectional channel (SSE/stdio/WebSocket). But Grok connects over
+# Streamable HTTP - request/response - so once a tool call's HTTP response is
+# sent, the server has NO channel to deliver the ping; it always times out,
+# and the session self-destructs ~5-8s after each tool call. Net effect: any
+# page Grok opens reverts to about:blank a few seconds later, so multi-step
+# web tasks and "leave the tab open" both fail.
+#
+# This is upstream bug microsoft/playwright-mcp#1646 (heartbeat unconditionally
+# on for Streamable HTTP); still unfixed as of 0.0.78 + the 2026-07-23 alpha
+# (both reproduced here). PLAYWRIGHT_MCP_PING_TIMEOUT_MS=0 makes pingTimeout()
+# return 0, and startHeartbeat() early-returns on `timeout <= 0` - no heartbeat,
+# no teardown. Verified: page survived a full 120s idle gap across separate
+# HTTP connections (it died at ~5-8s without this). Override with
+# GROK_BUILD_PLAYWRIGHT_PING_TIMEOUT_MS if a future fix needs the heartbeat back.
+$pingTimeout = $env:GROK_BUILD_PLAYWRIGHT_PING_TIMEOUT_MS
+if (-not $pingTimeout) { $pingTimeout = "0" }
+$env:PLAYWRIGHT_MCP_PING_TIMEOUT_MS = $pingTimeout
+
 # Headed is the default (do not pass --headless) - the whole point is a
 # visible Chrome that survives across turns.
 $proc = Start-Process -FilePath $npx -ArgumentList $argList `

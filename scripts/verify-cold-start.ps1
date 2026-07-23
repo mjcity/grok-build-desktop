@@ -44,12 +44,16 @@ try {
   Step "skills-shape" $false $_.Exception.Message
 }
 
-# 3) Hermes process with a real main window handle within timeout
+# 3) Hermes/GrokBuild process with a real main window handle within timeout
+# GrokBuild.cmd normally launches the re-branded GrokBuild.exe copy (see
+# scripts/build-grok-app.mjs); GROK_BUILD_NO_REBRAND=1 falls back to stock
+# Hermes.exe. Check both names - stale here once already caused a false FAIL
+# after the 2026-07-21 rebranding work renamed the running process.
 $handle = 0
 $hermes = $null
 $deadline = (Get-Date).AddSeconds($HandleTimeoutSec)
 while ((Get-Date) -lt $deadline) {
-  $hermes = Get-Process -Name Hermes -ErrorAction SilentlyContinue |
+  $hermes = Get-Process -Name GrokBuild, Hermes -ErrorAction SilentlyContinue |
     Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
   if ($hermes) { $handle = $hermes.MainWindowHandle; break }
   Start-Sleep -Milliseconds 500

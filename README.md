@@ -55,6 +55,7 @@ Hermes's protocol on one side and drives your real `grok` CLI on the other.
 | 🗂️ **Session list & history** | Titles, search, archive — stored locally, survives restarts. |
 | 🧬 **Self-improvement** | Grok remembers durable facts across sessions, and reflects on genuinely hard tasks in the background. See [below](#self-improvement). |
 | 🩹 **Self-healing gateway** | A supervisor restarts a crashed backend; a stall watchdog recovers a hung turn instead of leaving you staring at "running" forever. |
+| 🔀 **Account fallback** | Have two Grok subscriptions? When one's weekly balance runs out, the gateway transparently switches the turn to the second account and keeps going — no interruption. Optional; see below. |
 | 🪪 **Its own identity** | Grok Build runs as a separately-named, separately-iconed app — its own taskbar button, icon, and window title, never merged with a stock Hermes install running beside it. |
 | 🖱️ **Real desktop control** | 50 tools — screenshot, click, type, scroll, drag, background/minimized-window control, accessibility tree, browser automation — via [cua-driver](https://github.com/trycua/cua) (MIT). A visible agent-cursor overlay shows what Grok is doing without ever touching your real mouse or keyboard focus. One-time install, see below. |
 
@@ -227,6 +228,35 @@ By default cua-driver's telemetry is **enabled** (it's a separate project
 with its own policy, not something this repo controls) — disable it
 yourself if you'd rather not: `cua-driver telemetry disable` (and
 `cua-driver telemetry reset-id` to also erase the installation id).
+
+### 🔀 Adding a fallback Grok account (optional)
+
+If you have a second Grok subscription (its own weekly *Grok Build* balance),
+the gateway can fall back to it automatically when the first runs dry. Grok
+stores its login in a per-home `auth.json`, and `GROK_HOME` points at that
+home — so a second account just lives in a second home:
+
+```powershell
+# 1. Log the second account into its own home (its own browser sign-in):
+$env:GROK_HOME = "$HOME\.grok-b"; grok login
+
+# 2. (optional) give it the same MCP servers / model config as your primary:
+Copy-Item "$HOME\.grok\config.toml" "$HOME\.grok-b\config.toml"
+```
+
+That's it — the gateway auto-detects any logged-in `~/.grok-b` and uses it as
+a fallback. When your active account returns
+`402 … Grok Build usage balance exhausted`, the gateway marks it spent,
+switches the **same turn** to the next account, and retries transparently.
+It then sticks with the fallback for the rest of the week (no wasted re-probe
+of the dead account each turn) and returns to your primary after the weekly
+reset (a gateway restart also re-probes it immediately). If every account is
+spent, you get one clear message instead of a cryptic error.
+
+Env knobs: `GROK_ACCOUNT_HOMES` (semicolon-separated homes, priority order —
+overrides the `~/.grok`, `~/.grok-b` default) and
+`GROK_ACCOUNT_RESET_WINDOW_MS` (how long a spent account is skipped before
+being re-probed; default ~6.5 days).
 
 ## ✅ Verifying an install
 

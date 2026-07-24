@@ -124,13 +124,94 @@ function findGrok() {
   return "grok";
 }
 
-function childEnv() {
+// ── Multi-account weekly-balance fallback ─────────────────────────────────
+// A Grok CLI login lives in a per-home auth.json; GROK_HOME overrides the
+// whole config dir (~/.grok). A second SuperGrok subscription with its own
+// weekly "Grok Build usage balance" lives in a second home (~/.grok-b). When
+// the active account's weekly balance is spent, grok.exe emits
+//   {"type":"error","message":"...API error (status 402 Payment Required):
+//    Grok Build usage balance exhausted..."}
+// (captured live 2026-07-24) — a clean, specific signal. On that, we mark the
+// account exhausted, switch the SAME turn to the next logged-in account's
+// home, and retry transparently. Sticky: once marked, we route straight to
+// the next account (no wasted per-turn re-probe of the dead one). The marker
+// auto-expires after ACCOUNT_RESET_WINDOW_MS so the primary returns after its
+// weekly reset, and a gateway restart clears markers (in-memory only) for a
+// free re-probe — a 402 costs nothing since the balance is already spent.
+const EXHAUSTION_RE = /402|payment required|usage balance exhausted|balance exhausted/i;
+const ACCOUNT_RESET_WINDOW_MS = Number(
+  process.env.GROK_ACCOUNT_RESET_WINDOW_MS || 6.5 * 24 * 60 * 60 * 1000
+);
+const ALL_EXHAUSTED_NOTE =
+  "⚠️ All linked Grok accounts are out of weekly Grok Build balance. " +
+  "The balance resets weekly — try again later, or log in another account " +
+  "(GROK_HOME=~/.grok-c grok login) to add more fallback capacity.";
+/** { homePath: epochMs } — in-memory only; cleared on gateway restart. */
+const exhaustedAt = new Map();
+
+function loadAccounts() {
+  // Priority order. Env override: GROK_ACCOUNT_HOMES = "C:\a;C:\b".
+  const raw = String(process.env.GROK_ACCOUNT_HOMES || "").trim();
+  const homes = raw
+    ? raw.split(path.delimiter).filter(Boolean)
+    : [path.join(os.homedir(), ".grok"), path.join(os.homedir(), ".grok-b")];
+  // Only homes that are actually LOGGED IN (auth.json present) can serve a
+  // turn — a home without it isn't usable fallback, so skip it silently
+  // rather than spawn a doomed grok on it.
+  return homes
+    .map((home, i) => ({ home, label: String.fromCharCode(65 + i) }))
+    .filter((a) => {
+      try {
+        return fs.existsSync(path.join(a.home, "auth.json"));
+      } catch {
+        return false;
+      }
+    });
+}
+
+function accountUsable(a, now) {
+  const ex = exhaustedAt.get(a.home);
+  return !ex || now - ex > ACCOUNT_RESET_WINDOW_MS;
+}
+
+function activeAccount() {
+  const now = Date.now();
+  return loadAccounts().find((a) => accountUsable(a, now)) || null;
+}
+
+function nextAccountAfter(home) {
+  const accounts = loadAccounts();
+  const now = Date.now();
+  const start = accounts.findIndex((a) => a.home === home) + 1;
+  for (let i = start; i < accounts.length; i++) {
+    if (accountUsable(accounts[i], now)) return accounts[i];
+  }
+  return null;
+}
+
+function markExhausted(home) {
+  exhaustedAt.set(home, Date.now());
+  log(`account exhausted (402): ${home}`);
+}
+
+function childEnv(accountHome) {
+  const defaultHome = path.join(os.homedir(), ".grok");
+  const home =
+    accountHome || (activeAccount() && activeAccount().home) || defaultHome;
   const env = {
     ...process.env,
     GROK_DISABLE_AUTOUPDATER: "1",
     NO_COLOR: "1",
     TERM: "dumb",
   };
+  // Only override GROK_HOME for a NON-default account, so primary-account
+  // turns run byte-identically to the pre-fallback behavior (grok already
+  // defaults to ~/.grok). The grok.exe BINARY is shared (lives in ~/.grok/bin,
+  // found via PATH below); only the config home changes per account, so the
+  // second account never needs its own binary.
+  if (path.resolve(home) !== path.resolve(defaultHome)) {
+    env.GROK_HOME = home;
+  }
   const extras = [
     path.join(os.homedir(), ".grok", "bin"),
     path.join(os.homedir(), ".local", "bin"),
@@ -684,10 +765,11 @@ function scheduleQueueDrain(session) {
 // ignores generic status kinds (gateway-event.ts only acts on
 // compacting/process).
 
-function grokSessionsRoot(cwd) {
+function grokSessionsRoot(cwd, accountHome) {
+  // Per-account: grok writes its session event log under its OWN GROK_HOME,
+  // so a fallback turn on account B tails ~/.grok-b/sessions, not ~/.grok.
   return path.join(
-    os.homedir(),
-    ".grok",
+    accountHome || path.join(os.homedir(), ".grok"),
     "sessions",
     encodeURIComponent(cwd || DEFAULT_CWD)
   );
@@ -701,8 +783,8 @@ function safeSize(file) {
   }
 }
 
-function startToolFeed(session, spawnedAtMs, { silent = false } = {}) {
-  const root = grokSessionsRoot(session.cwd || DEFAULT_CWD);
+function startToolFeed(session, spawnedAtMs, { silent = false, accountHome = null, resumeId = null } = {}) {
+  const root = grokSessionsRoot(session.cwd || DEFAULT_CWD, accountHome);
   let eventsPath = null;
   let offset = 0;
   let carry = "";
@@ -713,8 +795,10 @@ function startToolFeed(session, spawnedAtMs, { silent = false } = {}) {
   const running = [];
 
   // Resumed session: the dir is known; skip everything already on disk.
-  if (session.grok_session_id) {
-    eventsPath = path.join(root, session.grok_session_id, "events.jsonl");
+  // Uses this account's resume id (per-account — see runGrokTurn), not the
+  // generic session.grok_session_id, so a fallback turn tails the right dir.
+  if (resumeId) {
+    eventsPath = path.join(root, resumeId, "events.jsonl");
     offset = Math.max(0, safeSize(eventsPath));
   }
 
@@ -866,7 +950,38 @@ function startToolFeed(session, spawnedAtMs, { silent = false } = {}) {
   };
 }
 
-function runGrokTurn(session, text, { silent = false } = {}) {
+function runGrokTurn(session, text, { silent = false, accountHome = null, retryCount = 0 } = {}) {
+  // Resolve which account (config home) this turn runs on. accountHome is set
+  // only when we're retrying after a 402 fallback; otherwise pick the active
+  // one. If every logged-in account is out of weekly balance, don't spawn a
+  // doomed grok — surface a clear message and settle the turn.
+  const home = accountHome || (activeAccount() && activeAccount().home) || null;
+  if (!home) {
+    if (!silent) {
+      emit(session.id, "session.info", sessionInfoPayload(session, true));
+      emit(session.id, "message.start");
+      emit(session.id, "message.delta", { text: ALL_EXHAUSTED_NOTE });
+      session.messages.push({ role: "assistant", content: ALL_EXHAUSTED_NOTE, timestamp: nowSec() });
+      session.updated_at = nowSec();
+      upsertSession(session);
+      emit(session.id, "message.complete", {
+        text: ALL_EXHAUSTED_NOTE,
+        usage: sessionUsage(session),
+        status: "error",
+      });
+      emit(session.id, "session.info", sessionInfoPayload(session, false));
+    }
+    activeTurns.delete(session.id);
+    return;
+  }
+
+  // Per-account grok session ids: a resume id created under account A's home
+  // does NOT exist under account B's, so track one id per home. On a fallback
+  // switch the new account simply starts fresh (grok's own --resume
+  // continuity is per-home; the gateway keeps the full transcript itself).
+  session.grok_session_ids = session.grok_session_ids || {};
+  const resumeId = session.grok_session_ids[home] || null;
+
   const binary = findGrok();
   const argv = [
     "--output-format",
@@ -884,7 +999,7 @@ function runGrokTurn(session, text, { silent = false } = {}) {
     session.cwd || DEFAULT_CWD,
     "--always-approve",
   ];
-  if (session.grok_session_id) argv.push("--resume", session.grok_session_id);
+  if (resumeId) argv.push("--resume", resumeId);
   argv.push("-p", text);
 
   let buffer = "";
@@ -892,19 +1007,20 @@ function runGrokTurn(session, text, { silent = false } = {}) {
   let reasoning = "";
   let cancelled = false; // user pressed Stop (session.interrupt)
   let autoKillReason = null; // "stall" | "absolute" — our watchdog fired, not the user
+  let sawExhaustion = false; // grok reported 402/usage-balance-exhausted — trigger account fallback
   let turnUsage = null;
   let turnNumTurns = null; // Grok's own internal tool-round-trip count — Tier 2's difficulty signal
   let finished = false;
   const turnStartedAt = Date.now();
 
   log(
-    `turn start session=${session.id.slice(0, 8)} resume=${session.grok_session_id || "-"}${silent ? " (silent/reflection)" : ""}`
+    `turn start session=${session.id.slice(0, 8)} account=${home} resume=${resumeId || "-"}${retryCount ? ` retry=${retryCount}` : ""}${silent ? " (silent/reflection)" : ""}`
   );
 
   const proc = spawn(binary, argv, {
     cwd:
       session.cwd && fs.existsSync(session.cwd) ? session.cwd : DEFAULT_CWD,
-    env: childEnv(),
+    env: childEnv(home),
     windowsHide: true,
   });
 
@@ -957,7 +1073,7 @@ function runGrokTurn(session, text, { silent = false } = {}) {
     },
   });
 
-  const toolFeed = startToolFeed(session, Date.now(), { silent });
+  const toolFeed = startToolFeed(session, Date.now(), { silent, accountHome: home, resumeId });
   if (!silent) startTurnKeepalive(session, session.id);
 
   // Always open the stream lifecycle before any CLI silence so a drained
@@ -997,7 +1113,12 @@ function runGrokTurn(session, text, { silent = false } = {}) {
         if (!silent) emit(session.id, "reasoning.delta", { text: ev.data });
       } else if (ev.type === "end") {
         const sid = ev.sessionId || ev.session_id;
-        if (sid) session.grok_session_id = String(sid);
+        if (sid) {
+          // Store per-account (this home's continuity) AND keep the generic
+          // field synced to the account that actually ran this turn.
+          session.grok_session_ids[home] = String(sid);
+          session.grok_session_id = String(sid);
+        }
         if (ev.usage && typeof ev.usage === "object") turnUsage = ev.usage;
         if (typeof ev.num_turns === "number") turnNumTurns = ev.num_turns;
         if (typeof ev.total_cost_usd === "number") {
@@ -1005,7 +1126,16 @@ function runGrokTurn(session, text, { silent = false } = {}) {
             (session.estimated_cost_usd || 0) + ev.total_cost_usd;
         }
       } else if (ev.type === "error") {
-        if (!silent) emit(session.id, "error", { message: ev.message || "grok error" });
+        const msg = String(ev.message || "grok error");
+        // Weekly Grok Build balance spent on this account → fall back to the
+        // next account (handled in the close handler). Don't surface the raw
+        // 402 to the UI; the retry (or the all-exhausted note) speaks for it.
+        if (EXHAUSTION_RE.test(msg)) {
+          sawExhaustion = true;
+          markExhausted(home);
+        } else if (!silent) {
+          emit(session.id, "error", { message: msg });
+        }
       }
     }
   });
@@ -1022,6 +1152,37 @@ function runGrokTurn(session, text, { silent = false } = {}) {
 
   proc.on("close", (code) => {
     clearInterval(watchdogTimer);
+
+    // Account fallback: this account's weekly balance is spent. Switch the
+    // SAME turn to the next logged-in account and retry, transparently — the
+    // user never sees the 402. Not for silent reflection turns (optional work
+    // shouldn't burn a second account's balance) and capped by account count
+    // so a run of exhausted accounts can't loop.
+    if (sawExhaustion && !finished) {
+      const next = silent ? null : nextAccountAfter(home);
+      if (next && retryCount < loadAccounts().length) {
+        log(
+          `account fallback session=${session.id.slice(0, 8)}: ${home} -> ${next.home} (retry ${retryCount + 1})`
+        );
+        toolFeed.stop();
+        if (!silent) clearTurnKeepalive(session.id);
+        runGrokTurn(session, text, {
+          silent,
+          accountHome: next.home,
+          retryCount: retryCount + 1,
+        });
+        return; // the retried turn owns finishing; don't settle this one
+      }
+      // No usable account left (or a silent turn): settle cleanly. For a
+      // visible turn, say so plainly instead of leaving an empty bubble.
+      if (!silent) {
+        full = ALL_EXHAUSTED_NOTE;
+        emit(session.id, "message.delta", { text: ALL_EXHAUSTED_NOTE });
+      }
+      finish(full, "error");
+      return;
+    }
+
     let status = "complete";
     if (autoKillReason) {
       // Our own watchdog killed it — distinct from a user Stop and from a
@@ -1189,7 +1350,9 @@ function runOneshot(instructions, input, cb) {
   ];
   const proc = spawn(findGrok(), argv, {
     cwd: DEFAULT_CWD,
-    env: childEnv(),
+    // Use whichever account still has weekly balance (no per-turn retry here —
+    // a oneshot helper failing is non-fatal and the caller degrades).
+    env: childEnv(activeAccount() && activeAccount().home),
     windowsHide: true,
   });
   let out = "";

@@ -170,8 +170,21 @@ function nowSec() {
  * last-resort backstop against a pathological loop that's "active" but
  * never finishing.
  */
+// Raised 3min -> 15min (2026-07-22, session 1754d813 incident). The stall
+// watchdog only recognizes `text`/`thought`/`end`/`error` stdout events as
+// activity (see the proc.stdout handler below) — it has NO visibility into a
+// single tool call that is legitimately still running. Grok's own
+// get_command_or_subagent_output can correctly block for minutes waiting on
+// a shared resource (e.g. claudeloop's single-writer TMM gate, documented at
+// up to ~12min under multi-agent contention) with zero stdout output the
+// whole time. At 3min, the watchdog killed that turn — and every identical
+// retry — 6 times in a row over an hour, including across a full app
+// restart (supervisor.mjs keeps this gateway alive independent of the
+// Electron window, so a restart just reconnects to the same doomed retry).
+// 15min comfortably clears that known worst case with margin. A genuinely
+// dead turn still recovers, just slower to detect.
 const STALL_TIMEOUT_MS = Number(
-  process.env.GROK_STALL_TIMEOUT_MS || 3 * 60 * 1000
+  process.env.GROK_STALL_TIMEOUT_MS || 15 * 60 * 1000
 );
 const ABSOLUTE_TIMEOUT_MS = Number(
   process.env.GROK_ABSOLUTE_TIMEOUT_MS || 45 * 60 * 1000

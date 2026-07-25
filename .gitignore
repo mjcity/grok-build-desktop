@@ -3,3 +3,4 @@ node_modules/
 *.log.[0-9]
 /tmp/
 /computer-use-mcp.bak-*/
+*.bak-*

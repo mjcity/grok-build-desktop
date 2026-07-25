@@ -319,6 +319,24 @@ let storeCache = null;
 let storeDirty = false;
 let saveTimer = null;
 
+/**
+ * Placeholder for a VISIBLE turn that produced no text at all (Stop pressed
+ * before the first token, spawn died silently, etc.).
+ *
+ * Why this exists (2026-07-25, sessions 1754d813 + 2da8d11e): persisting an
+ * assistant message with content:"" permanently wedges that thread in Hermes
+ * Desktop. An empty bubble is not a visible message, so the thread's last
+ * VISIBLE message stays the user's (lastVisibleMessageIsUser -> true) and the
+ * view keeps treating the turn as still in flight — the composer never frees
+ * up, so new prompts never even reach this gateway (confirmed: zero
+ * `turn start` AND zero `busy reject` lines for a session the user was
+ * actively retrying). It survives app restarts because the empty message is
+ * on disk, which is why "stop the process and resend" never helped. Sessions
+ * with empty assistant messages MID-history were unaffected — only a trailing
+ * one wedges. Always terminate a visible turn with real text.
+ */
+const EMPTY_TURN_NOTE = "⏹️ Stopped — this turn ended before any output was produced.";
+
 function loadStore() {
   if (storeCache) return storeCache;
   try {
@@ -327,6 +345,29 @@ function loadStore() {
     storeCache = { sessions: [] };
   }
   if (!Array.isArray(storeCache.sessions)) storeCache.sessions = [];
+  // Self-heal records poisoned by older builds, so an already-frozen thread
+  // comes back to life on the next gateway start instead of staying dead
+  // forever. Only the TRAILING message is touched — history is never rewritten.
+  let repaired = 0;
+  for (const s of storeCache.sessions) {
+    const msgs = Array.isArray(s?.messages) ? s.messages : null;
+    if (!msgs || !msgs.length) continue;
+    const last = msgs[msgs.length - 1];
+    if (last && last.role === "assistant" && !String(last.content || "").trim()) {
+      last.content = EMPTY_TURN_NOTE;
+      repaired += 1;
+    }
+  }
+  if (repaired) {
+    storeDirty = true;
+    if (!saveTimer) {
+      saveTimer = setTimeout(() => {
+        saveTimer = null;
+        flushStore();
+      }, 40);
+    }
+    log(`unwedged ${repaired} session(s) with a trailing empty assistant message`);
+  }
   return storeCache;
 }
 
@@ -1218,6 +1259,16 @@ function runGrokTurn(session, text, { silent = false, accountHome = null, retryC
   function finish(content, status) {
     if (finished) return;
     finished = true;
+    // Never end a VISIBLE turn with empty text — that is what wedges the
+    // desktop thread forever (see EMPTY_TURN_NOTE). Substituted here, before
+    // both the persisted message and the emitted message.complete, so the two
+    // can never disagree. Reflection turns are invisible and stay untouched.
+    if (!silent && !String(content || "").trim()) {
+      content = EMPTY_TURN_NOTE;
+      log(
+        `empty visible turn session=${session.id.slice(0, 8)} status=${status} — substituted stop note`
+      );
+    }
     clearInterval(watchdogTimer); // no-op if already cleared in the close handler
     toolFeed.stop(); // settle chips before message.complete
     if (!silent) clearTurnKeepalive(session.id);
@@ -2051,9 +2102,19 @@ wss.on("connection", (ws) => {
 
         case "prompt.submit": {
           let session = params.session_id ? getSession(params.session_id) : null;
-          if (!session) return err(4001, "session not found");
+          // These two early-returns used to be SILENT. During the 2026-07-25
+          // wedge that made the logs actively misleading: a rejected submit
+          // looked identical to no submit at all, so "the UI is stuck" and
+          // "the gateway refused it" were indistinguishable. Always log.
+          if (!session) {
+            log(`prompt reject: session not found id=${String(params.session_id || "-").slice(0, 8)}`);
+            return err(4001, "session not found");
+          }
           const text = String(params.text || "").trim();
-          if (!text) return err(-32602, "empty prompt");
+          if (!text) {
+            log(`prompt reject: empty prompt session=${session.id.slice(0, 8)}`);
+            return err(-32602, "empty prompt");
+          }
           if (params.cwd && typeof params.cwd === "string")
             session.cwd = params.cwd;
 

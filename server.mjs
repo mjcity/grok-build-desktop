@@ -566,8 +566,26 @@ function sessionUsage(s) {
   };
 }
 
-/** session.info EVENT payload (tui_gateway _session_info; desktop_contract 4
- *  as of upstream 98cadad — adds approval_mode, project, stored_session_id). */
+/**
+ * session.info EVENT payload (mirrors tui_gateway's _session_info).
+ *
+ * desktop_contract history (upstream apps/desktop/src/store/updates.ts):
+ *   v2 file.attach RPC · v3 approvals.mode RPCs + info reconciliation
+ *   v4 explicit Fast-off session creation + session-scoped Fast edits
+ *   v5 raised WebSocket frame size for large one-shot file.attach
+ *
+ * We declare 5 (verified against upstream 40e0e7ad, 2026-08-01). Field-shape
+ * parity was checked key-by-key: we already send every v5 top-level field
+ * (plus two harmless extras the renderer ignores, mcp_servers/system_prompt).
+ * The v5 frame-size requirement is satisfied by default — our WebSocketServer
+ * sets no maxPayload, so it uses ws's ~100MB default, far above the raised
+ * bar. Honest caveat: we don't implement the file.attach RPC itself (this
+ * gateway drives the Grok CLI rather than Hermes's own file staging), so
+ * explicitly attaching a file in the composer is unsupported here — that is
+ * pre-existing and unrelated to the contract number. Everything the contract
+ * check actually gates (session.info shape on every session open) is met, so
+ * declaring 4 only produced a false "backend out of date" toast.
+ */
 function sessionInfoPayload(s, running) {
   return {
     model: s.model || MODEL,
@@ -586,7 +604,7 @@ function sessionInfoPayload(s, running) {
     running: !!running,
     title: s.title || "",
     stored_session_id: s.id,
-    desktop_contract: 4,
+    desktop_contract: 5,
     version: VERSION,
     release_date: RELEASE_DATE,
     update_behind: 0,

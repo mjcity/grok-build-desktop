@@ -279,25 +279,52 @@ if (fs.existsSync(mainMjs)) {
     // pass fileExists. Reorder so the unpacked (replaceable) path is first.
     // The bundler's path-module alias (path15 etc.) drifts across builds —
     // match it, never hardcode it.
-    const iconOrderRe =
-      /var APP_ICON_PATHS = \[\n  (\w+)\.join\(APP_ROOT, "public", "apple-touch-icon\.png"\),\n  \1\.join\(APP_ROOT, "dist", "apple-touch-icon\.png"\),\n  \1\.join\(unpackedPathFor\(APP_ROOT\), "dist", "apple-touch-icon\.png"\)\n\];/;
+    // Layout-agnostic: match the whole array body whatever upstream puts in
+    // it, then force OUR unpacked png to be the first candidate. Upstream has
+    // already changed this array's shape once (2026-08-01 / 40e0e7ad
+    // prepended a Windows-only `resources/icon.ico` + `assets/icon.ico`
+    // branch AHEAD of the png entries, which silently defeated the old
+    // exact-shape regex and would have fallen the window icon back to stock).
+    // Prepending instead of rewriting a known list means future upstream
+    // additions can't win the `find(fileExists)` race against us again.
+    const ICON_MARKER = 'unpackedPathFor(APP_ROOT), "dist", "apple-touch-icon.png"),\n  ...';
+    const iconOrderRe = /var APP_ICON_PATHS = \[\n([\s\S]*?)\n\];/;
     const iconOrderMatch = src.match(iconOrderRe);
-    if (iconOrderMatch) {
-      const v = iconOrderMatch[1];
-      src = src.replace(
-        iconOrderRe,
-        "var APP_ICON_PATHS = [\n" +
-          `  ${v}.join(unpackedPathFor(APP_ROOT), "dist", "apple-touch-icon.png"),\n` +
-          `  ${v}.join(APP_ROOT, "public", "apple-touch-icon.png"),\n` +
-          `  ${v}.join(APP_ROOT, "dist", "apple-touch-icon.png")\n` +
-          "];"
-      );
-    } else if (
-      !src.includes('unpackedPathFor(APP_ROOT), "dist", "apple-touch-icon.png"),')
-    ) {
+    if (iconOrderMatch && !src.includes(ICON_MARKER)) {
+      const body = iconOrderMatch[1];
+      // Reuse the bundler's own path-module alias (path21 etc. — it drifts
+      // every build, so never hardcode it) from any join() already in there.
+      const aliasMatch = body.match(/(\w+)\.join\(/);
+      if (aliasMatch) {
+        const v = aliasMatch[1];
+        src = src.replace(
+          iconOrderRe,
+          "var APP_ICON_PATHS = [\n" +
+            `  ${v}.join(unpackedPathFor(APP_ROOT), "dist", "apple-touch-icon.png"),\n` +
+            `  ...[\n${body}\n  ]\n` +
+            "];"
+        );
+      } else {
+        console.error(
+          "[build-grok-app] WARNING: APP_ICON_PATHS found but no path alias inside - live window icon may fall back to the stock icon"
+        );
+      }
+    } else if (!iconOrderMatch) {
       console.error(
-        "[build-grok-app] WARNING: APP_ICON_PATHS pattern not found in electron-main.mjs - upstream layout changed; the live window icon will fall back to the asar-packed stock icon"
+        "[build-grok-app] WARNING: APP_ICON_PATHS not found in electron-main.mjs - upstream layout changed; the live window icon will fall back to the stock icon"
       );
+    }
+    // Windows-only (new upstream 40e0e7ad): the icon list now starts with
+    // resources/icon.ico, which Electron ALSO uses for the window icon. Even
+    // with our png prepended, replace it so every icon surface is ours.
+    try {
+      const resIco = path.join(targetDir, "resources", "icon.ico");
+      if (fs.existsSync(resIco) && fs.existsSync(iconPath)) {
+        fs.copyFileSync(iconPath, resIco);
+        console.log(`[build-grok-app] replaced ${resIco} with the Grok Build icon`);
+      }
+    } catch (e) {
+      console.error(`[build-grok-app] WARNING: could not replace resources/icon.ico: ${e.message}`);
     }
     fs.writeFileSync(mainMjs, src);
     console.log(

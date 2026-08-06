@@ -17,6 +17,8 @@ rem                          and launch stock Hermes.exe directly
 rem    GROK_BUILD_NO_PLAYWRIGHT  set to 1 to skip auto-starting the Playwright
 rem                          MCP server Grok's config expects on 127.0.0.1:8931
 rem    GROK_BUILD_PLAYWRIGHT_PS1  override the Playwright MCP starter script
+rem    GROK_BUILD_NO_PLAYWRIGHT_CHROME  set to 1 to skip the extension-mode
+rem                          Playwright MCP on 8932 that drives your real browser
 rem    GROK_BUILD_PLAYWRIGHT_DIR  Playwright profile/log dir (default: tmp\playwright next to this repo)
 rem    GROK_BUILD_NO_CUA_DRIVER  set to 1 to skip auto-starting the cua-driver
 rem                          daemon (real desktop control: screenshot/click/
@@ -132,6 +134,33 @@ if errorlevel 1 (
   echo %date% %time% launcher: Playwright MCP ready >> "%BOOT_LOG%"
 )
 :playwright_done
+
+rem --- 1b-2) Playwright MCP in EXTENSION mode on 8932 - drives YOUR real browser ---
+rem The 8931 instance above launches an ISOLATED Chrome with its own profile:
+rem clean, logged into nothing. This second instance instead attaches to the
+rem Chrome/Edge you are already using - your live logins, your open tabs - via
+rem Microsoft's official "Playwright Extension" from the Chrome Web Store.
+rem Both run together on different ports so Grok gets both toolsets and picks
+rem per task: isolated for scraping, extension for "act on the tab I'm on".
+rem Without the extension installed the server still runs; its tools simply
+rem report no connected tab, so this is safe to start unconditionally.
+rem   GROK_BUILD_NO_PLAYWRIGHT_CHROME=1   skip this second instance
+if "%GROK_BUILD_NO_PLAYWRIGHT%"=="1" goto playwright_chrome_done
+if "%GROK_BUILD_NO_PLAYWRIGHT_CHROME%"=="1" goto playwright_chrome_done
+if not exist "%PLAYWRIGHT_PS1%" goto playwright_chrome_done
+"%SystemRoot%\System32\netstat.exe" -ano | "%SYSFINDSTR%" /C:":8932" | "%SYSFINDSTR%" /C:"LISTENING" >nul 2>nul
+if not errorlevel 1 (
+  echo %date% %time% launcher: Playwright MCP extension-mode already listening on 8932 >> "%BOOT_LOG%"
+  goto playwright_chrome_done
+)
+echo %date% %time% launcher: starting Playwright MCP extension-mode on 8932 >> "%BOOT_LOG%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PLAYWRIGHT_PS1%" -Extension -Port 8932 >> "%BOOT_LOG%" 2>&1
+if errorlevel 1 (
+  echo %date% %time% launcher: WARN Playwright MCP extension-mode failed to start - continuing without real-browser tools >> "%BOOT_LOG%"
+) else (
+  echo %date% %time% launcher: Playwright MCP extension-mode ready >> "%BOOT_LOG%"
+)
+:playwright_chrome_done
 
 rem --- 1c) cua-driver - real desktop control: screenshot/click/type/scroll/UIA ---
 rem Grok's config.toml points mcp_servers.cua_driver at a STDIO command, so

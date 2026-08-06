@@ -58,6 +58,7 @@ Hermes's protocol on one side and drives your real `grok` CLI on the other.
 | 🔀 **Account fallback** | Have two Grok subscriptions? When one's weekly balance runs out, the gateway transparently switches the turn to the second account and keeps going — no interruption. Optional; see below. |
 | 🪪 **Its own identity** | Grok Build runs as a separately-named, separately-iconed app — its own taskbar button, icon, and window title, never merged with a stock Hermes install running beside it. |
 | 🖱️ **Real desktop control** | 50 tools — screenshot, click, type, scroll, drag, background/minimized-window control, accessibility tree, browser automation — via [cua-driver](https://github.com/trycua/cua) (MIT). A visible agent-cursor overlay shows what Grok is doing without ever touching your real mouse or keyboard focus. One-time install, see below. |
+| 🌐 **Two browsers, your pick** | [Playwright MCP](https://github.com/microsoft/playwright-mcp) runs twice: an **isolated** Chrome (clean profile, logged into nothing — safe for scraping) and an **extension** mode that drives *your real* Chrome/Edge with your live logins and open tabs. Grok picks per task. See below. |
 
 ## 💰 CLI subscription vs. API token — why this matters
 
@@ -228,6 +229,32 @@ By default cua-driver's telemetry is **enabled** (it's a separate project
 with its own policy, not something this repo controls) — disable it
 yourself if you'd rather not: `cua-driver telemetry disable` (and
 `cua-driver telemetry reset-id` to also erase the installation id).
+
+### 🌐 Browser automation: isolated vs. your real Chrome
+
+`GrokBuild.cmd` starts **two** Playwright MCP servers, and Grok chooses per task:
+
+| | Port | Browser | Use it for |
+|---|---|---|---|
+| `playwright` | 8931 | Chrome we launch, **isolated profile** — logged into nothing | Scraping, throwaway automation, anything you don't want touching your real session |
+| `playwright_chrome` | 8932 | **Your own running Chrome/Edge** — live logins, your open tabs | "Act on the tab I'm looking at", anything behind a login |
+
+The isolated one works out of the box. The real-browser one needs Microsoft's
+official extension — one click, no config:
+
+> Install **[Playwright Extension](https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm)** from the Chrome Web Store.
+
+Until it's installed, `playwright_chrome`'s tools stay present but return a
+clear *"Playwright Extension not found — install it from …"* message rather
+than failing cryptically. Skip the second instance entirely with
+`GROK_BUILD_NO_PLAYWRIGHT_CHROME=1`.
+
+> **Note on extension mode:** it depends on a fix for upstream
+> [playwright-mcp#1646](https://github.com/microsoft/playwright-mcp/issues/1646)
+> (a heartbeat that tore down the session ~5s after every tool call over
+> Streamable HTTP, which hit extension mode hardest). The launcher sets
+> `PLAYWRIGHT_MCP_PING_TIMEOUT_MS=0` to disable that heartbeat — without it,
+> your connected tab drops moments after each call.
 
 ### 🔀 Adding a fallback Grok account (optional)
 

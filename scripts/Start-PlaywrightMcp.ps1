@@ -26,17 +26,44 @@
 # package from the registry first, and early-exit detection reports the
 # actual npx failure instead of a generic bind timeout.
 #
-# Usage: powershell -NoProfile -ExecutionPolicy Bypass -File Start-PlaywrightMcp.ps1
+# TWO MODES (2026-08-01). Default (no args) is unchanged: an ISOLATED Chrome
+# with its own profile - clean, logged into nothing, safe for scraping and
+# throwaway automation.
+#
+#   -Extension  attaches to your REAL, already-running Chrome/Edge instead,
+#               reusing your live logins and open tabs, via Microsoft's
+#               official "Playwright Extension" (Chrome Web Store:
+#               chromewebstore.google.com/detail/playwright-extension/
+#               mmlmfjhmonkocbjadbfplnigmagldckm). No --user-data-dir and no
+#               --shared-browser-context in this mode: the browser is YOURS,
+#               not one we launch, so profile/context flags don't apply.
+#
+# Both can run at once on different ports (8931 isolated / 8932 extension) -
+# they're independent server processes, so Grok gets both toolsets and picks
+# per task. Extension mode is exactly the scenario upstream bug #1646 broke;
+# the PLAYWRIGHT_MCP_PING_TIMEOUT_MS=0 fix below is what makes it usable.
+#
+# Usage:
+#   powershell -NoProfile -ExecutionPolicy Bypass -File Start-PlaywrightMcp.ps1
+#   powershell -NoProfile -ExecutionPolicy Bypass -File Start-PlaywrightMcp.ps1 -Extension -Port 8932
+param(
+  [int]$Port = 0,
+  [switch]$Extension
+)
 
 $ErrorActionPreference = "Stop"
-$port = 8931
+if ($Port -le 0) { $Port = if ($Extension) { 8932 } else { 8931 } }
+$port = $Port
 $hostBind = "127.0.0.1"
+$modeTag = if ($Extension) { "extension" } else { "isolated" }
 # Portable default: env override, else next to this script (works on any
-# clone/machine, not just the original dev box).
+# clone/machine, not just the original dev box). Per-mode subdir so the two
+# instances never share output/log files.
 $baseDir = $env:GROK_BUILD_PLAYWRIGHT_DIR
 if (-not $baseDir) {
   $baseDir = Join-Path (Split-Path -Parent $PSScriptRoot) "tmp\playwright"
 }
+if ($Extension) { $baseDir = Join-Path $baseDir "extension" }
 $profileDir = Join-Path $baseDir "playwright-user-data"
 $outDir = Join-Path $baseDir "playwright-output"
 $logOut = Join-Path $baseDir "playwright-mcp-stdout.log"
@@ -57,20 +84,34 @@ New-Item -ItemType Directory -Path $profileDir, $outDir -Force | Out-Null
 $existing = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
   Select-Object -ExpandProperty OwningProcess -Unique
 if ($existing) {
-  Write-Host "Playwright MCP already listening on port $port (PID(s): $($existing -join ', '))"
+  Write-Host "Playwright MCP [$modeTag] already listening on port $port (PID(s): $($existing -join ', '))"
   exit 0
 }
 
-$argList = @(
-  "-y", "@playwright/mcp@latest",
-  "--port", "$port",
-  "--host", $hostBind,
-  "--browser", "chrome",
-  "--user-data-dir", $profileDir,
-  "--output-dir", $outDir,
-  "--shared-browser-context",
-  "--viewport-size", "1280x800"
-)
+if ($Extension) {
+  # Attaches to the user's own running browser via the Playwright Extension.
+  # Deliberately NO --user-data-dir / --shared-browser-context / --viewport-size:
+  # we don't own this browser, so launching-profile flags are meaningless here
+  # (and --user-data-dir is rejected outright alongside --extension).
+  $argList = @(
+    "-y", "@playwright/mcp@latest",
+    "--port", "$port",
+    "--host", $hostBind,
+    "--extension",
+    "--output-dir", $outDir
+  )
+} else {
+  $argList = @(
+    "-y", "@playwright/mcp@latest",
+    "--port", "$port",
+    "--host", $hostBind,
+    "--browser", "chrome",
+    "--user-data-dir", $profileDir,
+    "--output-dir", $outDir,
+    "--shared-browser-context",
+    "--viewport-size", "1280x800"
+  )
+}
 
 # CRITICAL for cross-turn persistence: disable @playwright/mcp's session
 # heartbeat by setting its ping timeout to 0.
@@ -123,6 +164,10 @@ if (-not $ready) {
   exit 1
 }
 
-Write-Host "Playwright MCP listening on http://localhost:${port}/mcp (npx PID $($proc.Id)) - clients MUST use the localhost hostname"
-Write-Host "Profile: $profileDir"
+Write-Host "Playwright MCP [$modeTag] listening on http://localhost:${port}/mcp (npx PID $($proc.Id)) - clients MUST use the localhost hostname"
+if ($Extension) {
+  Write-Host "Mode: attaches to your OWN running Chrome/Edge - requires the 'Playwright Extension' from the Chrome Web Store"
+} else {
+  Write-Host "Profile: $profileDir (isolated - logged into nothing)"
+}
 Write-Host "Logs: $logErr"

@@ -605,6 +605,13 @@ function sessionInfoPayload(s, running) {
     title: s.title || "",
     stored_session_id: s.id,
     desktop_contract: 5,
+    // Added upstream 2026-08 (still contract 5 — additive, renderer type-guards
+    // it). NOT cosmetic: the desktop keys attachment handling off this. Any of
+    // CONTAINER_TERMINAL_BACKENDS (docker/ssh/singularity/modal/daytona/
+    // vercel_sandbox) makes it upload dropped files, because the backend can't
+    // see host paths. We spawn grok.exe locally, sharing Electron's filesystem,
+    // so "local" is the honest answer and host paths pass through untouched.
+    terminal_backend: "local",
     version: VERSION,
     release_date: RELEASE_DATE,
     update_behind: 0,

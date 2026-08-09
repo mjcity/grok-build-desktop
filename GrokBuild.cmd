@@ -20,6 +20,8 @@ rem    GROK_BUILD_PLAYWRIGHT_PS1  override the Playwright MCP starter script
 rem    GROK_BUILD_NO_PLAYWRIGHT_CHROME  set to 1 to skip the extension-mode
 rem                          Playwright MCP on 8932 that drives your real browser
 rem    GROK_BUILD_PLAYWRIGHT_DIR  Playwright profile/log dir (default: tmp\playwright next to this repo)
+rem    GROK_BUILD_NO_ACCOUNT_CONFIG_SYNC  set to 1 to stop mirroring the primary
+rem                          config.toml into the .grok-b fallback account home
 rem    GROK_BUILD_NO_CUA_DRIVER  set to 1 to skip auto-starting the cua-driver
 rem                          daemon (real desktop control: screenshot/click/
 rem                          type/scroll/UIA). Install once from README.
@@ -204,6 +206,31 @@ if %cua_tries% gtr 20 (
 if errorlevel 1 goto wait_cua_driver
 echo %date% %time% launcher: cua-driver daemon ready >> "%BOOT_LOG%"
 :cua_driver_done
+
+rem --- 1d) keep the fallback account's config in sync with the primary ---
+rem The weekly-balance fallback runs grok.exe with GROK_HOME=%USERPROFILE%\.grok-b,
+rem which means it reads THAT home's config.toml - a different file. When
+rem .grok-b was set up its config was copied once, so every later change to
+rem the primary config silently failed to reach it: on 2026-08-08 the fallback
+rem account was still missing playwright_chrome and pointed at a long-dead
+rem node_repl path, so Grok lost tools the moment it fell back. auth.json is
+rem per-account and is NEVER touched here - only config.toml is mirrored, so
+rem both accounts always expose the same MCP servers, skills and model config.
+rem   GROK_BUILD_NO_ACCOUNT_CONFIG_SYNC=1   leave the fallback config alone
+if "%GROK_BUILD_NO_ACCOUNT_CONFIG_SYNC%"=="1" goto account_sync_done
+set "GROK_A_CFG=%USERPROFILE%\.grok\config.toml"
+set "GROK_B_DIR=%USERPROFILE%\.grok-b"
+if not exist "%GROK_A_CFG%" goto account_sync_done
+if not exist "%GROK_B_DIR%\auth.json" goto account_sync_done
+"%SystemRoot%\System32\fc.exe" /B "%GROK_A_CFG%" "%GROK_B_DIR%\config.toml" >nul 2>nul
+if not errorlevel 1 goto account_sync_done
+copy /Y "%GROK_A_CFG%" "%GROK_B_DIR%\config.toml" >nul 2>nul
+if errorlevel 1 (
+  echo %date% %time% launcher: WARN could not sync fallback account config >> "%BOOT_LOG%"
+) else (
+  echo %date% %time% launcher: synced primary config.toml to fallback account .grok-b >> "%BOOT_LOG%"
+)
+:account_sync_done
 
 rem --- 2) repair window-state.json only if missing/corrupt ---
 "%NODE_EXE%" "%GATEWAY_DIR%repair-window-state.mjs" "%PROFILE_DIR%\window-state.json" >> "%BOOT_LOG%" 2>nul

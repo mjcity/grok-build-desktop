@@ -39,7 +39,9 @@ const DATA =
   process.env.GROK_GATEWAY_HOME ||
   path.join(os.homedir(), ".grok-hermes-desktop");
 const LOGS = path.join(DATA, "logs");
-const MODEL = process.env.GROK_GATEWAY_MODEL || "grok-4.5";
+const MODEL = process.env.GROK_GATEWAY_MODEL || "grok-4.6";
+const REASONING_EFFORT =
+  process.env.GROK_GATEWAY_REASONING_EFFORT || "medium";
 const PROVIDER = "grok-cli";
 const VERSION = "1.4.2"; // mirrors the Hermes build the desktop shipped with
 const RELEASE_DATE = "2026-07-01";
@@ -590,7 +592,7 @@ function sessionInfoPayload(s, running) {
   return {
     model: s.model || MODEL,
     provider: PROVIDER,
-    reasoning_effort: "",
+    reasoning_effort: REASONING_EFFORT,
     service_tier: "",
     fast: false,
     yolo: true, // grok runs with --always-approve
@@ -604,8 +606,20 @@ function sessionInfoPayload(s, running) {
     running: !!running,
     title: s.title || "",
     stored_session_id: s.id,
-    desktop_contract: 5,
-    // Added upstream 2026-08 (still contract 5 — additive, renderer type-guards
+    // Contract 6 (upstream 2026-08-13). Each level is a capability assertion,
+    // so this is only bumped after checking what the level actually demands —
+    // never as a cosmetic way to silence the skew toast:
+    //   v2 file.attach RPC · v3 approvals.mode RPCs · v4 explicit Fast-off
+    //   session creation · v5 raised WS frame size for one-shot file.attach
+    //   v6 key-addressed plugins.manage rows (keyless rows render read-only)
+    // v6 is vacuously satisfied here: we don't implement plugins.manage at all
+    // (Grok owns its plugins via ~/.grok/config.toml), so the RPC returns a
+    // clean JSON-RPC -32601 and Settings → Plugins gets ZERO rows. With no
+    // rows there are no keyless rows to mis-render, which is the only thing
+    // v6 guards. v2/v3/v5 concern file.attach + approvals RPCs we likewise
+    // don't serve; v4's session-creation shape we already honor.
+    desktop_contract: 6,
+    // Added upstream 2026-08 (arrived under contract 5 — additive, renderer type-guards
     // it). NOT cosmetic: the desktop keys attachment handling off this. Any of
     // CONTAINER_TERMINAL_BACKENDS (docker/ssh/singularity/modal/daytona/
     // vercel_sandbox) makes it upload dropped files, because the backend can't
@@ -1061,6 +1075,8 @@ function runGrokTurn(session, text, { silent = false, accountHome = null, retryC
     "--experimental-memory",
     "-m",
     session.model || MODEL,
+    "--reasoning-effort",
+    REASONING_EFFORT,
     "--cwd",
     session.cwd || DEFAULT_CWD,
     "--always-approve",
@@ -1419,6 +1435,8 @@ function runOneshot(instructions, input, cb) {
     "--no-auto-update",
     "-m",
     MODEL,
+    "--reasoning-effort",
+    REASONING_EFFORT,
     "--cwd",
     DEFAULT_CWD,
     "-p",
@@ -1649,7 +1667,7 @@ const server = http.createServer(async (req, res) => {
     ) {
       return respond(200, {
         model: { default: MODEL, provider: PROVIDER, base_url: "" },
-        agent: { reasoning_effort: "", service_tier: "", personalities: {} },
+        agent: { reasoning_effort: REASONING_EFFORT, service_tier: "", personalities: {} },
         display: { personality: "", skin: "" },
         terminal: { cwd: DEFAULT_CWD },
         stt: { enabled: false },

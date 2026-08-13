@@ -143,9 +143,21 @@ $proc = Start-Process -FilePath $npx -ArgumentList $argList `
   -WorkingDirectory $baseDir -WindowStyle Hidden -PassThru `
   -RedirectStandardOutput $logOut -RedirectStandardError $logErr
 
-# Cold npx runs download the package first - allow up to 60s to bind.
+# Wait for the port to bind. RAISED 60s -> 240s (2026-08-13): we pin nothing
+# and ask for `@playwright/mcp@latest`, and upstream publishes a new alpha most
+# days, so npx re-resolves and re-downloads the package far more often than a
+# "warm cache" intuition suggests. A cold download routinely ran past 60s here,
+# and the failure mode was quietly wrong rather than loud: the script exited 1,
+# the launcher logged "failed to start" and moved on, but the npx process it had
+# already spawned kept going and bound the port a minute or two LATER. Net
+# effect on 8932/extension mode - the server looked dead at launch, came up
+# unannounced afterwards, and whether Grok saw the toolset depended on when its
+# session happened to start. Override with GROK_BUILD_PLAYWRIGHT_BIND_TIMEOUT_S.
+$bindTimeoutS = $env:GROK_BUILD_PLAYWRIGHT_BIND_TIMEOUT_S
+if (-not $bindTimeoutS) { $bindTimeoutS = 240 }
+$bindTimeoutS = [int]$bindTimeoutS
 $ready = $false
-for ($i = 0; $i -lt 120; $i++) {
+for ($i = 0; $i -lt ($bindTimeoutS * 2); $i++) {
   Start-Sleep -Milliseconds 500
   if ($proc.HasExited) {
     Write-Error "npx exited (code $($proc.ExitCode)) before binding port $port. Last stderr:"
@@ -159,7 +171,9 @@ for ($i = 0; $i -lt 120; $i++) {
 }
 
 if (-not $ready) {
-  Write-Error "Playwright MCP did not bind port $port within 60s. See $logErr"
+  # The spawned npx is still alive here (HasExited was false every poll), so it
+  # may yet bind. Say that plainly instead of implying the server is dead.
+  Write-Error "Playwright MCP [$modeTag] did not bind port $port within ${bindTimeoutS}s; npx PID $($proc.Id) is still running and may bind later. See $logErr"
   if (Test-Path $logErr) { Get-Content $logErr -Tail 30 | Write-Host }
   exit 1
 }

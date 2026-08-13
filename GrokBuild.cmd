@@ -20,6 +20,8 @@ rem    GROK_BUILD_PLAYWRIGHT_PS1  override the Playwright MCP starter script
 rem    GROK_BUILD_NO_PLAYWRIGHT_CHROME  set to 1 to skip the extension-mode
 rem                          Playwright MCP on 8932 that drives your real browser
 rem    GROK_BUILD_PLAYWRIGHT_DIR  Playwright profile/log dir (default: tmp\playwright next to this repo)
+rem    GROK_BUILD_NO_NODE_REPL_HEAL  set to 1 to stop auto-repairing the node_repl
+rem                          MCP path when Codex rotates its runtime hash
 rem    GROK_BUILD_NO_ACCOUNT_CONFIG_SYNC  set to 1 to stop mirroring the primary
 rem                          config.toml into the .grok-b fallback account home
 rem    GROK_BUILD_NO_CUA_DRIVER  set to 1 to skip auto-starting the cua-driver
@@ -30,6 +32,8 @@ rem ============================================================
 
 if not defined GROK_BUILD_PORT set "GROK_BUILD_PORT=8787"
 if not defined GROK_BUILD_TOKEN set "GROK_BUILD_TOKEN=local-grok-dev-token"
+if not defined GROK_GATEWAY_MODEL set "GROK_GATEWAY_MODEL=grok-4.6"
+if not defined GROK_GATEWAY_REASONING_EFFORT set "GROK_GATEWAY_REASONING_EFFORT=medium"
 set "GW_URL=http://127.0.0.1:%GROK_BUILD_PORT%"
 
 rem The gateway lives next to this script - no install path to configure.
@@ -91,7 +95,7 @@ rem Start-Process rejects identical RedirectStandardOutput/-Error paths.
 rem Supervisor owns gateway-out.log; console stream goes to supervisor-console.log.
 set "SUP_OUT=%LOG_DIR%\supervisor-console.log"
 set "SUP_ERR=%LOG_DIR%\supervisor-console.err.log"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:GROK_GATEWAY_PORT='%GROK_BUILD_PORT%'; $env:GROK_GATEWAY_TOKEN='%GROK_BUILD_TOKEN%'; Start-Process -FilePath '%NODE_EXE%' -ArgumentList 'supervisor.mjs' -WorkingDirectory '%GATEWAY_DIR%.' -WindowStyle Hidden -RedirectStandardOutput '%SUP_OUT%' -RedirectStandardError '%SUP_ERR%'"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:GROK_GATEWAY_PORT='%GROK_BUILD_PORT%'; $env:GROK_GATEWAY_TOKEN='%GROK_BUILD_TOKEN%'; $env:GROK_GATEWAY_MODEL='%GROK_GATEWAY_MODEL%'; $env:GROK_GATEWAY_REASONING_EFFORT='%GROK_GATEWAY_REASONING_EFFORT%'; Start-Process -FilePath '%NODE_EXE%' -ArgumentList 'supervisor.mjs' -WorkingDirectory '%GATEWAY_DIR%.' -WindowStyle Hidden -RedirectStandardOutput '%SUP_OUT%' -RedirectStandardError '%SUP_ERR%'"
 
 set /a tries=0
 :wait_gateway
@@ -206,6 +210,20 @@ if %cua_tries% gtr 20 (
 if errorlevel 1 goto wait_cua_driver
 echo %date% %time% launcher: cua-driver daemon ready >> "%BOOT_LOG%"
 :cua_driver_done
+
+rem --- 1c-2) self-heal the node_repl MCP path ---
+rem node_repl is Codex's binary and lives under a content-hashed runtime dir.
+rem Every Codex update mints a new hash and deletes the old dir, silently
+rem invalidating the absolute path pinned in Grok's config - the server then
+rem vanishes from every session with no obvious signal. Re-pinned by hand three
+rem times in three weeks before this step existed. The script only rewrites
+rem when the configured path is GONE and exactly one healthy replacement
+rem exists; ambiguity is left alone. Runs BEFORE the fallback-config sync below
+rem so account B inherits the repaired path in the same launch.
+if "%GROK_BUILD_NO_NODE_REPL_HEAL%"=="1" goto node_repl_heal_done
+if not exist "%GATEWAY_DIR%scripts\fix-node-repl-path.mjs" goto node_repl_heal_done
+"%NODE_EXE%" "%GATEWAY_DIR%scripts\fix-node-repl-path.mjs" >> "%BOOT_LOG%" 2>&1
+:node_repl_heal_done
 
 rem --- 1d) keep the fallback account's config in sync with the primary ---
 rem The weekly-balance fallback runs grok.exe with GROK_HOME=%USERPROFILE%\.grok-b,

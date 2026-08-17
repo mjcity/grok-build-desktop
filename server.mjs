@@ -173,7 +173,25 @@ function loadAccounts() {
 
 function accountUsable(a, now) {
   const ex = exhaustedAt.get(a.home);
-  return !ex || now - ex > ACCOUNT_RESET_WINDOW_MS;
+  if (!ex) return true;
+  // A marker is keyed by HOME PATH, not by account identity. If the user runs
+  // `grok login` into an exhausted home — swapping in a different account, or
+  // the same one after its weekly reset — auth.json is rewritten. Treat
+  // credentials newer than the marker as "this folder is a different account
+  // now" and re-probe immediately. Without this, a fresh login stays invisible
+  // until ACCOUNT_RESET_WINDOW_MS elapses or the gateway restarts (real
+  // incident 2026-08-17: a 0%-used account sat unused behind a stale marker).
+  try {
+    const mtime = fs.statSync(path.join(a.home, "auth.json")).mtimeMs;
+    if (mtime > ex) {
+      exhaustedAt.delete(a.home);
+      log(`re-login detected (auth.json newer than marker), clearing exhausted: ${a.home}`);
+      return true;
+    }
+  } catch {
+    // No auth.json — loadAccounts() already filters these out; stay conservative.
+  }
+  return now - ex > ACCOUNT_RESET_WINDOW_MS;
 }
 
 function activeAccount() {

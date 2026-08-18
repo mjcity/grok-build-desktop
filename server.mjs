@@ -633,6 +633,53 @@ function sessionUsage(s) {
  * the block-scalar case explicit and impossible to get subtly wrong.
  */
 /** Grok's own skills directory for the account currently serving turns. */
+// ── image attachments ─────────────────────────────────────────────────────
+// Grok is vision-capable and, verified directly, reads an image when its path
+// appears in the prompt (a PNG containing "PURPLE-ZEBRA-42" came back read
+// correctly). So attachments are handled as PATHS: the desktop hands us a path
+// or raw bytes, we make sure a real file exists on disk, and the next turn's
+// prompt points Grok at it. No provider-specific multimodal encoding needed.
+const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]);
+const ATTACH_MAX_BYTES = 24 * 1024 * 1024;
+
+function attachDir() {
+  const d = path.join(DATA, "attachments");
+  fs.mkdirSync(d, { recursive: true });
+  return d;
+}
+
+/** Identify a format from magic bytes; filename is only a hint. */
+function sniffImageExt(buf, filenameHint = "") {
+  const b = buf;
+  if (b.length > 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return ".png";
+  if (b.length > 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return ".jpg";
+  if (b.length > 6 && b.slice(0, 3).toString("latin1") === "GIF") return ".gif";
+  if (b.length > 12 && b.slice(0, 4).toString("latin1") === "RIFF" && b.slice(8, 12).toString("latin1") === "WEBP") return ".webp";
+  if (b.length > 2 && b[0] === 0x42 && b[1] === 0x4d) return ".bmp";
+  const hinted = path.extname(String(filenameHint || "")).toLowerCase();
+  return IMAGE_EXTS.has(hinted) ? hinted : ".png";
+}
+
+function attachedList(session) {
+  if (!Array.isArray(session.attached_images)) session.attached_images = [];
+  return session.attached_images;
+}
+
+/**
+ * Fold pending attachments into the prompt Grok receives.
+ *
+ * Kept out of the transcript the user sees: the desktop already renders its own
+ * attachment chips, so duplicating the paths into the visible message would be
+ * noise. Paths are listed one per line under a short instruction because that
+ * is the form Grok was verified to act on.
+ */
+function withAttachments(session, text) {
+  const imgs = attachedList(session);
+  if (!imgs.length) return text;
+  const lines = imgs.map((f) => f).join("\n");
+  return `${text}\n\n[Attached image${imgs.length > 1 ? "s" : ""} — read the file${imgs.length > 1 ? "s" : ""} at:]\n${lines}`;
+}
+
 function grokSkillsDir() {
   const home =
     (activeAccount() && activeAccount().home) || path.join(os.homedir(), ".grok");
@@ -1694,11 +1741,22 @@ function scheduleReflection(session) {
 }
 
 function submitPrompt(session, text) {
+  // The transcript keeps the user's own words; only what we hand Grok gets the
+  // attachment paths appended, so the chat doesn't show plumbing the desktop
+  // already renders as chips.
+  const forGrok = withAttachments(session, text);
   session.messages.push({ role: "user", content: text, timestamp: nowSec() });
   session.updated_at = nowSec();
   if (!session.title) session.title = text.slice(0, 56);
+  // Attachments are consumed by the turn they are sent with, matching the
+  // desktop, which clears its chips on send. Leaving them queued would silently
+  // re-attach the same image to every later turn in the session.
+  if (attachedList(session).length) {
+    log(`sending ${session.attached_images.length} attachment(s) with turn session=${session.id.slice(0, 8)}`);
+    session.attached_images = [];
+  }
   upsertSession(session);
-  runGrokTurn(session, text);
+  runGrokTurn(session, forGrok);
 }
 
 function runOneshot(instructions, input, cb) {
@@ -2704,6 +2762,70 @@ wss.on("connection", (ws) => {
           if (UNSUPPORTED_OK.has(method)) {
             ok({ ok: true });
             return;
+          }
+          if (method === "image.attach" || method === "image.attach_bytes") {
+            const session = getSession(params.session_id);
+            if (!session) return err(4001, "session not found");
+            let filePath = null;
+            if (method === "image.attach") {
+              const raw = String(params.path || "").trim().replace(/^["']|["']$/g, "");
+              if (!raw) return err(4015, "path required");
+              if (!fs.existsSync(raw)) return err(4016, `image not found: ${raw}`);
+              if (!IMAGE_EXTS.has(path.extname(raw).toLowerCase())) {
+                return err(4016, `unsupported image: ${path.basename(raw)}`);
+              }
+              filePath = raw;
+            } else {
+              // Remote/paste path: the client has bytes, not a path we can read.
+              const b64 = String(params.content_base64 || params.data || "")
+                .replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, "")
+                .replace(/\s+/g, "");
+              if (!b64) return err(4015, "content_base64 required");
+              let buf;
+              try {
+                buf = Buffer.from(b64, "base64");
+              } catch {
+                return err(4017, "data is not valid base64");
+              }
+              if (!buf || !buf.length) return err(4017, "image is empty");
+              if (buf.length > ATTACH_MAX_BYTES) {
+                return err(4018, `image too large (${buf.length} bytes; cap is ${ATTACH_MAX_BYTES / (1024 * 1024)} MB)`);
+              }
+              const ext = sniffImageExt(buf, params.filename || params.ext || "");
+              if (!IMAGE_EXTS.has(ext)) return err(4016, `unsupported image extension: ${ext}`);
+              const name = `upload-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`;
+              filePath = path.join(attachDir(), name);
+              try {
+                fs.writeFileSync(filePath, buf);
+              } catch (e) {
+                return err(5027, `write failed: ${e.message}`);
+              }
+            }
+            const list = attachedList(session);
+            if (!list.includes(filePath)) list.push(filePath);
+            upsertSession(session);
+            log(`image attached session=${session.id.slice(0, 8)} -> ${path.basename(filePath)} (${list.length} pending)`);
+            return ok({
+              attached: true,
+              path: filePath,
+              count: list.length,
+              remainder: "",
+              text: `[User attached image: ${path.basename(filePath)}]`,
+            });
+          }
+          if (method === "image.detach") {
+            const session = getSession(params.session_id);
+            if (!session) return err(4001, "session not found");
+            const raw = String(params.path || "").trim();
+            if (!raw) return err(4015, "path required");
+            const list = attachedList(session);
+            const before = list.length;
+            session.attached_images = list.filter((f) => f !== raw);
+            upsertSession(session);
+            return ok({
+              detached: session.attached_images.length !== before,
+              count: session.attached_images.length,
+            });
           }
           err(-32601, `Unknown method: ${method}`);
           return;

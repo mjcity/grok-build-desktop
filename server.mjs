@@ -606,6 +606,115 @@ function sessionUsage(s) {
  * check actually gates (session.info shape on every session open) is met, so
  * declaring 4 only produced a false "backend out of date" toast.
  */
+/**
+ * Real skills Grok can actually use, for GET /api/skills.
+ *
+ * We used to answer [] here, which is why the desktop's Capabilities view said
+ * "No skills found" even though Grok has dozens. Grok resolves skills from
+ * `[skills] paths` in its config.toml plus its own <home>/skills, and a skill
+ * is a directory containing SKILL.md whose YAML frontmatter carries `name:`
+ * and `description:`. We read exactly that - no invented metadata.
+ *
+ * Deliberately read-only and best-effort: an absent path or unreadable file is
+ * skipped rather than failing the whole request, because a broken Capabilities
+ * pane is worse than a partial one. `enabled` is reported true because Grok
+ * loads every skill on its resolved paths - we do not model a per-skill toggle
+ * we cannot actually honor, since a switch that silently does nothing is worse
+ * than no switch. Account-aware: reads the home of whichever account is live,
+ * so the fallback account lists its own skills.
+ */
+/**
+ * Read one scalar out of YAML frontmatter, handling the block-scalar forms.
+ *
+ * Written as a line walk rather than a regex on purpose: the obvious
+ * /^key:\s*([\s\S]*?)(?=\n\w+:|$)/m stops dead at the `>` because with the `m`
+ * flag `$` matches END OF LINE, not end of string - so every skill using
+ * `description: >` reported its description as a bare ">". Line-walking makes
+ * the block-scalar case explicit and impossible to get subtly wrong.
+ */
+function readYamlScalar(frontmatter, key) {
+  const lines = String(frontmatter).split(/\r?\n/);
+  const head = new RegExp("^" + key + ":[ \t]*(.*)$");
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(head);
+    if (!m) continue;
+    const inline = m[1].trim();
+    // Not a block scalar - the value is right here.
+    if (inline && !/^[>|][-+0-9]*$/.test(inline)) {
+      return inline.replace(/^["']|["']$/g, "");
+    }
+    // Block scalar: take the indented continuation lines that follow.
+    const body = [];
+    for (let j = i + 1; j < lines.length; j++) {
+      const ln = lines[j];
+      if (ln.trim() === "") { body.push(""); continue; }
+      if (!/^[ \t]/.test(ln)) break; // dedented - next key
+      body.push(ln.trim());
+    }
+    return body.join(" ").trim();
+  }
+  return "";
+}
+
+function listGrokSkills(includeFile = false) {
+  const roots = [];
+  const grokHome =
+    (activeAccount() && activeAccount().home) || path.join(os.homedir(), ".grok");
+  roots.push(path.join(grokHome, "skills"));
+  try {
+    const cfg = fs.readFileSync(path.join(grokHome, "config.toml"), "utf8");
+    const block = cfg.match(/\[skills\][\s\S]*?paths\s*=\s*\[([\s\S]*?)\]/);
+    if (block) {
+      for (const m of block[1].matchAll(/["']([^"']+)["']/g)) roots.push(m[1]);
+    }
+  } catch {
+    /* no config / unreadable - the built-in dir above still applies */
+  }
+
+  const out = [];
+  const seen = new Set();
+  for (const root of roots) {
+    let entries;
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true });
+    } catch {
+      continue; // configured but absent on this machine
+    }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const file = path.join(root, e.name, "SKILL.md");
+      let raw;
+      try {
+        raw = fs.readFileSync(file, "utf8");
+      } catch {
+        continue; // a directory without SKILL.md is not a skill
+      }
+      // YAML frontmatter only; fall back to the folder name so a malformed
+      // header still shows up instead of vanishing from the list.
+      const fm = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+      const head = fm ? fm[1] : "";
+      const nameM = head.match(/^name:\s*(.+)$/m);
+      const descText = readYamlScalar(head, "description");
+      const name = String(nameM ? nameM[1] : e.name)
+        .trim()
+        .replace(/^["']|["']$/g, "");
+      if (!name || seen.has(name)) continue; // first path wins, matching Grok's precedence
+      seen.add(name);
+      const row = {
+        name,
+        description: descText.replace(/\s+/g, " ").trim().slice(0, 500),
+        category: "grok",
+        enabled: true,
+        provenance: "agent",
+      };
+      if (includeFile) row._file = file;
+      out.push(row);
+    }
+  }
+  out.sort((a, b) => a.name.localeCompare(b.name));
+  return out;
+}
+
 function sessionInfoPayload(s, running) {
   return {
     model: s.model || MODEL,
@@ -644,6 +753,18 @@ function sessionInfoPayload(s, running) {
     // see host paths. We spawn grok.exe locally, sharing Electron's filesystem,
     // so "local" is the honest answer and host paths pass through untouched.
     terminal_backend: "local",
+    // Added upstream 2026-08-18 (still contract 6). Epoch SECONDS the current
+    // turn started, or null when idle - the desktop multiplies by 1000 and
+    // uses it to keep the turn-elapsed timer honest across session switches
+    // and session.info heartbeats. Reported only for a VISIBLE turn: a silent
+    // Tier 2 reflection is not a turn the user is watching a timer for, so
+    // surfacing its clock would make the UI count time against nothing.
+    turn_started_at: (() => {
+      const inflight = activeTurns.get(s.id);
+      return inflight && !inflight.silent && inflight.startedAt
+        ? inflight.startedAt / 1000
+        : null;
+    })(),
     version: VERSION,
     release_date: RELEASE_DATE,
     update_behind: 0,
@@ -1166,6 +1287,14 @@ function runGrokTurn(session, text, { silent = false, accountHome = null, retryC
   if (typeof watchdogTimer.unref === "function") watchdogTimer.unref();
 
   activeTurns.set(session.id, {
+    // Marks this as Tier 2 housekeeping rather than something the user asked
+    // for. prompt.submit uses it to preempt instead of rejecting - see the
+    // "session busy" branch there.
+    silent,
+    // Epoch ms this turn began; sessionInfoPayload reports it as
+    // turn_started_at so the desktop's elapsed-turn timer survives session
+    // switches instead of restarting at 0:00.
+    startedAt: turnStartedAt,
     cancel: () => {
       cancelled = true;
       clearInterval(watchdogTimer);
@@ -1380,11 +1509,31 @@ function runGrokTurn(session, text, { silent = false, accountHome = null, retryC
         title: session.title || "",
       });
     } else {
+      const savedNothing = /NOTHING_TO_SAVE/i.test(content);
       log(
         `reflection result session=${session.id.slice(0, 8)}: ${
-          /NOTHING_TO_SAVE/i.test(content) ? "nothing to save" : content.slice(0, 200)
+          savedNothing ? "nothing to save" : content.slice(0, 200)
         }`
       );
+      // Tell the user what self-improvement actually saved. Hermes has a
+      // dedicated lane for exactly this - `review.summary` - which the desktop
+      // renders as a PERSISTENT system row in the transcript (its own comment:
+      // "without this handler the skill/memory change happens silently ... it
+      // must not be a transient toast that can be missed"). Real Hermes emits
+      // it from its background review agent; we never did, so Tier 2 wrote to
+      // memory/skills completely invisibly and the only evidence a user ever
+      // saw was the session going busy. Same event, same rendering, so it
+      // reads identically to stock Hermes.
+      //
+      // Only when something was actually saved: a NOTHING_TO_SAVE reflection
+      // is a no-op, and a row claiming otherwise would be noise that erodes
+      // trust in the rows that do matter. A reflection preempted by a user
+      // prompt reaches here with empty content and stays silent too.
+      if (!savedNothing && content && content.trim()) {
+        emit(session.id, "review.summary", {
+          text: `Self-improvement review: ${content.trim()}`,
+        });
+      }
     }
 
     // Drain gateway queue only when we intentionally accepted one (queue /
@@ -1877,7 +2026,22 @@ const server = http.createServer(async (req, res) => {
 
     // ── sidebar/settings sections ───────────────────────────────────
     if (req.method === "GET" && p === "/api/skills") {
-      return respond(200, []);
+      return respond(200, listGrokSkills());
+    }
+    // Raw SKILL.md for the Capabilities detail pane.
+    if (req.method === "GET" && p === "/api/skills/content") {
+      const want = String(url.searchParams.get("name") || "");
+      const hit = listGrokSkills(true).find((x) => x.name === want);
+      if (!hit) return respond(404, { detail: "skill not found" });
+      try {
+        return respond(200, {
+          content: fs.readFileSync(hit._file, "utf8"),
+          name: hit.name,
+          path: hit._file,
+        });
+      } catch (e) {
+        return respond(404, { detail: String((e && e.message) || e) });
+      }
     }
     if (req.method === "GET" && p === "/api/skills/hub/sources") {
       return respond(200, {
@@ -2178,6 +2342,48 @@ wss.on("connection", (ws) => {
           }
           if (params.cwd && typeof params.cwd === "string")
             session.cwd = params.cwd;
+
+          const inFlight = activeTurns.get(session.id);
+          // A Tier 2 reflection is invisible, optional housekeeping that we
+          // scheduled ourselves - it must never make the user wait behind it.
+          // It runs through the same activeTurns lock as a real turn (on
+          // purpose: concurrent turns on one grok session race its on-disk
+          // session locks), so before this branch existed the lock leaked
+          // straight into the UI as "Prompt failed / session busy" for the
+          // 1-2 minutes a reflection takes after a hard turn. Hermes retries
+          // ~20x at ~155ms and then gives up, so the user had to resend by
+          // hand. 587 such rejects were logged before this fix.
+          //
+          // Cancel the reflection, wait for its close handler to release the
+          // lock, then run the user's turn normally so they never see an
+          // error. We deliberately do NOT enqueue: Hermes's own retry is the
+          // other delivery path, and doing both risks submitting twice.
+          if (inFlight && inFlight.silent) {
+            log(
+              `preempting reflection for user prompt session=${session.id.slice(0, 8)}`
+            );
+            inFlight.cancel();
+            const deadline = Date.now() + 5000;
+            const runWhenFree = () => {
+              if (!activeTurns.has(session.id)) {
+                ok({ status: "streaming" });
+                submitPrompt(session, text);
+                return;
+              }
+              if (Date.now() > deadline) {
+                // Cancel did not release in time - fall back to the normal
+                // busy contract rather than dropping the prompt silently.
+                log(
+                  `preempt timeout session=${session.id.slice(0, 8)} - falling back to busy`
+                );
+                err(4009, "session busy");
+                return;
+              }
+              setTimeout(runWhenFree, 50);
+            };
+            runWhenFree();
+            return;
+          }
 
           if (activeTurns.has(session.id)) {
             // Hermes Desktop ignores the JSON body of a successful

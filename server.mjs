@@ -632,6 +632,116 @@ function sessionUsage(s) {
  * `description: >` reported its description as a bare ">". Line-walking makes
  * the block-scalar case explicit and impossible to get subtly wrong.
  */
+/** Grok's own skills directory for the account currently serving turns. */
+function grokSkillsDir() {
+  const home =
+    (activeAccount() && activeAccount().home) || path.join(os.homedir(), ".grok");
+  return path.join(home, "skills");
+}
+
+/** Locate Hermes's CLI, which owns the real hub installer. */
+function findHermesCli() {
+  const candidates = [
+    process.env.GROK_GATEWAY_HERMES_CLI,
+    path.join(
+      process.env.LOCALAPPDATA || "",
+      "hermes",
+      "hermes-agent",
+      "venv",
+      "Scripts",
+      "hermes.exe"
+    ),
+  ];
+  for (const c of candidates) {
+    if (c && fs.existsSync(c)) return c;
+  }
+  return null;
+}
+
+/** Reject anything that could escape the skills directory. */
+function safeSkillName(name) {
+  const n = String(name || "").trim();
+  return /^[A-Za-z0-9._-]{1,128}$/.test(n) && n !== "." && n !== ".." ? n : null;
+}
+
+/**
+ * Install a Skills-Hub skill into GROK's skills directory.
+ *
+ * We do NOT reimplement the hub client. tools/skills_hub.py is ~1500 lines of
+ * source resolution, SSRF-guarded fetching, path validation, lockfiles,
+ * quarantine and a security scanner (skills-guard) that decides ALLOWED vs
+ * blocked - reproducing that in Node would mean reproducing its security
+ * properties, badly. Instead we drive Hermes's own `hermes skills install`
+ * with HERMES_HOME pointed at a scratch dir, then move the finished skill
+ * folder into Grok's skills dir. Grok and Hermes both read SKILL.md, so the
+ * artifact is directly usable; the scratch home exists only because the
+ * installer derives its target from HERMES_HOME and we want its output, not
+ * a second Hermes profile.
+ *
+ * The scan still runs and still blocks - we get its verdict, not a bypass.
+ */
+function hubInstallToGrok(identifier, cb) {
+  const cli = findHermesCli();
+  if (!cli) {
+    return cb({ ok: false, error: "Hermes CLI not found - cannot reach the Skills Hub" });
+  }
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "grok-skill-"));
+  const child = spawn(cli, ["skills", "install", String(identifier), "--yes"], {
+    env: { ...process.env, HERMES_HOME: scratch, NO_COLOR: "1" },
+    windowsHide: true,
+  });
+  let out = "";
+  child.stdout.on("data", (c) => (out += c));
+  child.stderr.on("data", (c) => (out += c));
+  const timer = setTimeout(() => {
+    try { child.kill(); } catch { /* already gone */ }
+  }, 5 * 60 * 1000);
+
+  child.on("error", (e) => {
+    clearTimeout(timer);
+    cb({ ok: false, error: String(e.message || e) });
+  });
+
+  child.on("close", () => {
+    clearTimeout(timer);
+    let installed = [];
+    try {
+      installed = fs
+        .readdirSync(path.join(scratch, "skills"), { withFileTypes: true })
+        .filter((e) => e.isDirectory() && !e.name.startsWith("."))
+        .filter((e) => fs.existsSync(path.join(scratch, "skills", e.name, "SKILL.md")))
+        .map((e) => e.name);
+    } catch {
+      installed = [];
+    }
+    if (!installed.length) {
+      // Nothing landed: the fetch failed, or skills-guard blocked it. Hand the
+      // installer's own words back rather than inventing a reason.
+      const tail = out.trim().split(/\r?\n/).filter(Boolean).slice(-4).join(" ");
+      try { fs.rmSync(scratch, { recursive: true, force: true }); } catch { /* best effort */ }
+      return cb({ ok: false, error: tail || "install produced no skill" });
+    }
+    const moved = [];
+    try {
+      fs.mkdirSync(grokSkillsDir(), { recursive: true });
+      for (const name of installed) {
+        const safe = safeSkillName(name);
+        if (!safe) continue;
+        const dest = path.join(grokSkillsDir(), safe);
+        fs.rmSync(dest, { recursive: true, force: true }); // reinstall == replace
+        fs.cpSync(path.join(scratch, "skills", safe), dest, { recursive: true });
+        moved.push(safe);
+      }
+    } catch (e) {
+      try { fs.rmSync(scratch, { recursive: true, force: true }); } catch { /* best effort */ }
+      return cb({ ok: false, error: `installed but could not place into Grok skills: ${e.message}` });
+    }
+    try { fs.rmSync(scratch, { recursive: true, force: true }); } catch { /* best effort */ }
+    log(`hub install -> grok skills: ${moved.join(", ")}`);
+    cb({ ok: true, names: moved });
+  });
+}
+
 function readYamlScalar(frontmatter, key) {
   const lines = String(frontmatter).split(/\r?\n/);
   const head = new RegExp("^" + key + ":[ \t]*(.*)$");
@@ -2041,6 +2151,28 @@ const server = http.createServer(async (req, res) => {
         });
       } catch (e) {
         return respond(404, { detail: String((e && e.message) || e) });
+      }
+    }
+    if (req.method === "POST" && p === "/api/skills/hub/install") {
+      const body = await readBody(req).catch(() => null);
+      const identifier = String((body && body.identifier) || "").trim();
+      if (!identifier) return respond(400, { detail: "identifier required" });
+      const r = await new Promise((resolve) => hubInstallToGrok(identifier, resolve));
+      if (!r.ok) return respond(502, { detail: r.error });
+      return respond(200, { ok: true, name: r.names[0] || identifier, pid: 0 });
+    }
+    if (req.method === "POST" && p === "/api/skills/hub/uninstall") {
+      const body = await readBody(req).catch(() => null);
+      const safe = safeSkillName(body && body.name);
+      if (!safe) return respond(400, { detail: "invalid skill name" });
+      const dir = path.join(grokSkillsDir(), safe);
+      if (!fs.existsSync(dir)) return respond(404, { detail: "skill not installed" });
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+        log(`hub uninstall from grok skills: ${safe}`);
+        return respond(200, { ok: true, name: safe, pid: 0 });
+      } catch (e) {
+        return respond(500, { detail: String((e && e.message) || e) });
       }
     }
     if (req.method === "GET" && p === "/api/skills/hub/sources") {

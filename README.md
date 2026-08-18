@@ -59,6 +59,9 @@ Hermes's protocol on one side and drives your real `grok` CLI on the other.
 | 🪪 **Its own identity** | Grok Build runs as a separately-named, separately-iconed app — its own taskbar button, icon, and window title, never merged with a stock Hermes install running beside it. |
 | 🖱️ **Real desktop control** | 50 tools — screenshot, click, type, scroll, drag, background/minimized-window control, accessibility tree, browser automation — via [cua-driver](https://github.com/trycua/cua) (MIT). A visible agent-cursor overlay shows what Grok is doing without ever touching your real mouse or keyboard focus. One-time install, see below. |
 | 🌐 **Two browsers, your pick** | [Playwright MCP](https://github.com/microsoft/playwright-mcp) runs twice: an **isolated** Chrome (clean profile, logged into nothing — safe for scraping) and an **extension** mode that drives *your real* Chrome/Edge with your live logins and open tabs. Grok picks per task. See below. |
+| 🖼️ **Image attachments** | Paste, drag, or point at a path — the image is handed to Grok, which reads it. Format is identified from the file's magic bytes, not its name, and attachments clear when the message sends so they never silently ride along on later turns. |
+| 🧩 **Your real skills, listed** | The Capabilities pane shows the skills Grok can actually use, read from its own `SKILL.md` files across every path it resolves — not an empty placeholder. |
+| 📥 **Skills Hub installs** | "Add to this Agent" installs into **Grok's** skills folder. It drives Hermes's own installer, so the upstream security scan still runs and still blocks — we consume its verdict rather than bypassing it. |
 
 ## 💰 CLI subscription vs. API token — why this matters
 
@@ -127,6 +130,13 @@ language.
 > mandatory, backup-first, and exit-code-gated.
 
 ## 🧬 Self-improvement
+
+> **You can see it happen.** When a reflection saves something, a
+> `Self-improvement review: …` row is written into the transcript (the same
+> `review.summary` lane stock Hermes uses), so a memory or skill change is
+> never silent. Nothing is posted when it decides there is nothing worth
+> saving. A reflection also never blocks you — send a message while one is
+> running and it is cancelled so your turn goes first.
 
 Real Hermes self-improves by forking its Python agent after every turn to
 judge what's worth remembering. We don't run that agent — so instead of

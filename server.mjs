@@ -171,6 +171,28 @@ const ALL_EXHAUSTED_NOTE =
 /** { homePath: epochMs } — in-memory only; cleared on gateway restart. */
 const exhaustedAt = new Map();
 
+// The account that most recently served a turn without a 402. Preferred for the
+// next turn so a user's message never pays to re-discover that a spent account
+// is still spent.
+//
+// Without this, priority order alone puts the primary first every time its
+// marker expires, and grok takes 8-22s to come back with the 402 - dead air on
+// the user's very next message, with nothing on screen to explain it. Making
+// the retry window short (so a reset account is noticed quickly) made that
+// happen every 20 minutes instead of once a week, which is how a latency fix
+// turned into "it stopped accepting messages". Leading with the known-good
+// account removes the probe from the critical path entirely: the others are
+// tried only when this one actually fails, which is exactly when we want to
+// know.
+let lastGoodHome = null;
+
+function markAccountWorked(home) {
+  if (home && lastGoodHome !== home) {
+    lastGoodHome = home;
+    log(`account now serving turns: ${home}`);
+  }
+}
+
 function loadAccounts() {
   // Priority order. Env override: GROK_ACCOUNT_HOMES = "C:\a;C:\b".
   const raw = String(process.env.GROK_ACCOUNT_HOMES || "").trim();
@@ -216,7 +238,14 @@ function accountUsable(a, now) {
 
 function activeAccount() {
   const now = Date.now();
-  return loadAccounts().find((a) => accountUsable(a, now)) || null;
+  const accounts = loadAccounts();
+  // Known-good first, then priority order. `accountUsable` still gates it, so a
+  // preferred account that later 402s stops being preferred immediately.
+  if (lastGoodHome) {
+    const preferred = accounts.find((a) => a.home === lastGoodHome);
+    if (preferred && accountUsable(preferred, now)) return preferred;
+  }
+  return accounts.find((a) => accountUsable(a, now)) || null;
 }
 
 function nextAccountAfter(home) {
@@ -231,6 +260,7 @@ function nextAccountAfter(home) {
 
 function markExhausted(home) {
   exhaustedAt.set(home, Date.now());
+  if (lastGoodHome === home) lastGoodHome = null;
   log(`account exhausted (402): ${home}`);
 }
 
@@ -1589,6 +1619,10 @@ function runGrokTurn(session, text, { silent = false, accountHome = null, retryC
       return;
     }
 
+    // This account answered without a 402, so it has balance. Remember it and
+    // lead with it next turn.
+    if (!sawExhaustion) markAccountWorked(home);
+
     let status = "complete";
     if (autoKillReason) {
       // Our own watchdog killed it — distinct from a user Stop and from a
@@ -2455,6 +2489,12 @@ const UNSUPPORTED_OK = new Set([
 
 wss.on("connection", (ws) => {
   sockets.add(ws);
+  // Liveness for the keepalive sweep below. A peer that answers our ping flips
+  // this back to true; one that doesn't gets reaped on the next tick.
+  ws.isAlive = true;
+  ws.on("pong", () => {
+    ws.isAlive = true;
+  });
   log(`ws connect (${sockets.size} open)`);
 
   send(ws, {
@@ -2865,6 +2905,53 @@ wss.on("connection", (ws) => {
     log(`ws error: ${e.message}`);
   });
 });
+
+// ── WebSocket keepalive ─────────────────────────────────────────
+// Stock Hermes serves /api/ws through uvicorn, which pings every 20s and drops
+// a client that fails to pong within 20s (ws_ping_interval / ws_ping_timeout,
+// both 20.0 by default). The `ws` library does none of that on its own, so this
+// gateway shipped a socket with NO keepalive at all — while the desktop app was
+// built against one that has it.
+//
+// That gap is invisible until it isn't. A socket can die quietly: sleep/wake, a
+// screen lock, a Wi-Fi blip, an idle NAT or firewall reaping the connection.
+// TCP does not notice, so the gateway keeps the dead socket in `sockets` and
+// the renderer keeps believing it is connected. The next prompt.submit is
+// written into a pipe nobody is reading — no error, no close event, and so none
+// of the desktop's reconnect logic (which only runs on a *detected* close) ever
+// fires. The chat box silently stops working until the app is restarted, which
+// is exactly the "after some time it stops accepting messages" report.
+//
+// Pinging fixes both halves. Regular traffic keeps idle reapers off the
+// connection, and when a peer really is gone the missed pong converts an
+// invisible half-open socket into a real close the client can act on. Browsers
+// and Electron renderers answer pings at the protocol level, so no client-side
+// change is needed.
+const WS_PING_INTERVAL_MS = Number(
+  process.env.GROK_WS_PING_INTERVAL_MS || 20_000
+);
+
+const wsKeepalive = setInterval(() => {
+  for (const ws of [...sockets]) {
+    if (ws.isAlive === false) {
+      // Missed the whole interval since the last ping — treat as gone. terminate()
+      // (not close()) because a half-open socket will never complete a closing
+      // handshake; this fires 'close', which drops it from `sockets` and lets the
+      // desktop reconnect.
+      log(`ws keepalive: no pong in ${WS_PING_INTERVAL_MS}ms, terminating dead socket`);
+      ws.terminate();
+      continue;
+    }
+    ws.isAlive = false;
+    try {
+      ws.ping();
+    } catch {
+      // Socket already tearing down; the 'close' handler does the bookkeeping.
+    }
+  }
+}, WS_PING_INTERVAL_MS);
+// Never hold the process open just to run the sweep.
+wsKeepalive.unref?.();
 
 server.listen(PORT, HOST, () => {
   log(`grok-gateway v2 listening on http://${HOST}:${PORT}`);

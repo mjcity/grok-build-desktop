@@ -137,17 +137,37 @@ function findGrok() {
 // account exhausted, switch the SAME turn to the next logged-in account's
 // home, and retry transparently. Sticky: once marked, we route straight to
 // the next account (no wasted per-turn re-probe of the dead one). The marker
-// auto-expires after ACCOUNT_RESET_WINDOW_MS so the primary returns after its
+// auto-expires after ACCOUNT_RETRY_AFTER_MS so the primary returns after its
 // weekly reset, and a gateway restart clears markers (in-memory only) for a
 // free re-probe — a 402 costs nothing since the balance is already spent.
 const EXHAUSTION_RE = /402|payment required|usage balance exhausted|balance exhausted/i;
-const ACCOUNT_RESET_WINDOW_MS = Number(
-  process.env.GROK_ACCOUNT_RESET_WINDOW_MS || 6.5 * 24 * 60 * 60 * 1000
+// How long an exhausted account stays skipped before we spend a spawn checking
+// it again. This is a RETRY interval, not a guess at when the weekly balance
+// resets - we cannot know that, and guessing it wrong strands a live account.
+//
+// It used to be 6.5 days, on the theory that the balance is weekly so an
+// earlier check is wasted. That reasoning is backwards: the reset is a
+// wall-clock event on xAI's side, so a marker set late in the week survives
+// most of the NEXT week and hides an account that is sitting at 0% used. That
+// is exactly what happened on 2026-08-19 - both accounts were marked at 05:36,
+// one reset hours later, and the gateway kept refusing turns with "all accounts
+// out of balance" because the marker had six more days to run. The only escapes
+// were a re-login or a gateway restart, neither of which the user should need.
+//
+// A re-probe costs nothing: grok returns 402 immediately when the balance is
+// spent, and a 402 does not consume balance. So the honest default is to check
+// again soon and let reality answer.
+const ACCOUNT_RETRY_AFTER_MS = Number(
+  process.env.GROK_ACCOUNT_RETRY_AFTER_MS ||
+    process.env.GROK_ACCOUNT_RESET_WINDOW_MS ||
+    20 * 60 * 1000
 );
 const ALL_EXHAUSTED_NOTE =
   "⚠️ All linked Grok accounts are out of weekly Grok Build balance. " +
-  "The balance resets weekly — try again later, or log in another account " +
-  "(GROK_HOME=~/.grok-c grok login) to add more fallback capacity.";
+  "Each account's balance resets weekly on its own schedule; just send the " +
+  "message again once one has reset — the gateway re-checks every account " +
+  "automatically and needs no restart. To add more fallback capacity, log in " +
+  "another account (GROK_HOME=~/.grok-c grok login).";
 /** { homePath: epochMs } — in-memory only; cleared on gateway restart. */
 const exhaustedAt = new Map();
 
@@ -179,7 +199,7 @@ function accountUsable(a, now) {
   // the same one after its weekly reset — auth.json is rewritten. Treat
   // credentials newer than the marker as "this folder is a different account
   // now" and re-probe immediately. Without this, a fresh login stays invisible
-  // until ACCOUNT_RESET_WINDOW_MS elapses or the gateway restarts (real
+  // until ACCOUNT_RETRY_AFTER_MS elapses or the gateway restarts (real
   // incident 2026-08-17: a 0%-used account sat unused behind a stale marker).
   try {
     const mtime = fs.statSync(path.join(a.home, "auth.json")).mtimeMs;
@@ -191,7 +211,7 @@ function accountUsable(a, now) {
   } catch {
     // No auth.json — loadAccounts() already filters these out; stay conservative.
   }
-  return now - ex > ACCOUNT_RESET_WINDOW_MS;
+  return now - ex > ACCOUNT_RETRY_AFTER_MS;
 }
 
 function activeAccount() {

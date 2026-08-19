@@ -292,8 +292,12 @@ spent, you get one clear message instead of a cryptic error.
 
 Env knobs: `GROK_ACCOUNT_HOMES` (semicolon-separated homes, priority order —
 overrides the `~/.grok`, `~/.grok-b` default) and
-`GROK_ACCOUNT_RESET_WINDOW_MS` (how long a spent account is skipped before
-being re-probed; default ~6.5 days).
+`GROK_ACCOUNT_RETRY_AFTER_MS` (how long a spent account is skipped before
+being re-probed; default 20 minutes). A re-probe is free — a spent account
+returns 402 instantly without consuming balance — so the gateway re-checks
+rather than trying to predict when your weekly balance resets. An account that
+resets picks up the very next message; no restart, no re-login.
+(`GROK_ACCOUNT_RESET_WINDOW_MS` still works as an alias.)
 
 ## ✅ Verifying an install
 

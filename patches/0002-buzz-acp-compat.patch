@@ -1,0 +1,82 @@
+diff --git a/acp_adapter/session.py b/acp_adapter/session.py
+index 870ec950b..d4b4d4f69 100644
+--- a/acp_adapter/session.py
++++ b/acp_adapter/session.py
+@@ -152,6 +152,18 @@ def _expand_acp_enabled_toolsets(
+         if server_name and toolset_name not in expanded:
+             expanded.append(toolset_name)
+ 
++    # Buzz Desktop (path ①) publishes via the buzz-reply plugin toolset.
++    # hermes-acp is coding-focused and omits messaging tools; without
++    # buzz_reply the model only has ``terminal`` and hangs on Git Bash
++    # bootstrap under buzz-acp (thinking visible, zero channel replies).
++    if "buzz_reply" not in expanded:
++        try:
++            from tools.registry import registry
++            if any(e.toolset == "buzz_reply" for e in registry._snapshot_entries()):
++                expanded.append("buzz_reply")
++        except Exception:
++            pass
++
+     return expanded
+ 
+ 
+diff --git a/tools/environments/local.py b/tools/environments/local.py
+index 8b7a479c5..031466d34 100644
+--- a/tools/environments/local.py
++++ b/tools/environments/local.py
+@@ -332,6 +332,26 @@ def _build_provider_env_blocklist() -> frozenset:
+     # It arrives via the registry loop above (anthropic api_key_env_vars),
+     # so remove it explicitly.
+     blocked.discard("CLAUDE_CODE_OAUTH_TOKEN")
++    # Buzz Desktop (path ①) injects these into hermes-acp so the agent can
++    # publish via `buzz messages send`.  Leaving them on the provider
++    # blocklist strips auth from terminal children and also refuses
++    # terminal.env_passthrough (GHSA-rhgp-j443-p4rf) — silent "thinking only"
++    # replies on Buzz.  Allow CLI auth through; do not put nsecs in skills.
++    for _buzz_var in (
++        "BUZZ_PRIVATE_KEY",
++        "BUZZ_RELAY_URL",
++        "BUZZ_AUTH_TAG",
++        "BUZZ_API_TOKEN",
++        "BUZZ_CLI_PATH",
++        "BUZZ_CREDENTIALS_FILE",
++        "BUZZ_POLL_INTERVAL",
++        "BUZZ_CHANNELS",
++        "BUZZ_HOME_CHANNEL",
++        "BUZZ_TRANSPORT",
++        "BUZZ_ALLOWED_USERS",
++        "BUZZ_ALLOW_ALL_USERS",
++    ):
++        blocked.discard(_buzz_var)
+     return frozenset(blocked)
+ 
+ 
+diff --git a/tools/tool_search.py b/tools/tool_search.py
+index 686e0f34e..3af74f6e3 100644
+--- a/tools/tool_search.py
++++ b/tools/tool_search.py
+@@ -201,6 +201,14 @@ def _core_tool_names() -> frozenset[str]:
+         return frozenset()
+ 
+ 
++# Path-critical plugin tools that must stay eager (never behind tool_search).
++# Buzz Desktop ACP requires an immediate channel publish; if this is deferred
++# the model falls back to ``terminal`` + Git Bash bootstrap and hangs.
++_NEVER_DEFER_TOOL_NAMES = frozenset({
++    "buzz_channel_send",
++})
++
++
+ def is_deferrable_tool_name(name: str) -> bool:
+     """Return True if a tool with this name is *eligible* for deferral.
+ 
+@@ -211,6 +219,8 @@ def is_deferrable_tool_name(name: str) -> bool:
+     """
+     if name in BRIDGE_TOOL_NAMES:
+         return False
++    if name in _NEVER_DEFER_TOOL_NAMES:
++        return False
+     if name in _core_tool_names():
+         return False
+     # Check registry toolset for MCP prefix.

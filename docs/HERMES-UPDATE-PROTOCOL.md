@@ -44,6 +44,40 @@ git -C $repo stash pop        # if you stashed and want the patches back
 # relaunch: D:\Program\grok\projects\hermes-agent-fork\grok-gateway\GrokBuild.cmd
 ```
 
+## 0b. Stock Hermes updated itself? Run the repair script
+
+This protocol covers a *deliberate* update. The other case is stock Hermes
+updating its own working tree behind your back — which breaks Grok Build every
+single time, because the two share one checkout. Its updater:
+
+* moves `HEAD` to a new commit,
+* **auto-stashes** local changes (our patches leave the working tree), and
+* **deletes `apps\desktop\release` entirely.**
+
+That last one is the startup failure. Grok Build has no Electron app of its own;
+it launches the binary Hermes's packager produces. With `release\` gone the
+launcher dies with:
+
+```
+launcher: FATAL Hermes.exe not found - set GROK_BUILD_HERMES_DIR
+```
+
+Nothing is corrupted and nothing is lost — it just has to be rebuilt:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\Repair-AfterHermesUpdate.ps1
+```
+
+It re-applies every `patches\*.patch` (skipping any already applied), stops the
+running apps, rebuilds, repackages, refreshes the Grok-branded copy, and then
+**greps the patch marker back out of the installed bundle** before declaring
+success. It refuses to run if `DESKTOP_BACKEND_CONTRACT` moved off 6 — that needs
+a gateway change first, and rebuilding would ship a backend lying about what it
+speaks. Then relaunch with `GrokBuild.cmd`.
+
+Observed 2026-08-19: an update pulled 101 commits (`d07be6e1` → `0b879298a`),
+contract stayed 6, and both patches re-applied cleanly.
+
 ## 1b. Local patch inventory — re-apply every one after the update
 
 Upstream rewrites history, so these never merge cleanly. Treat this list as the
@@ -52,9 +86,9 @@ the patch survived.
 
 | File (in the Hermes repo) | What we change | Marker to grep |
 |---|---|---|
-| `acp_adapter/session.py` | Buzz ACP compatibility | see `git stash` from §1 |
-| `tools/environments/local.py` | Buzz ACP compatibility | see `git stash` from §1 |
-| `tools/tool_search.py` | Buzz ACP compatibility | see `git stash` from §1 |
+| `acp_adapter/session.py` | Buzz ACP compatibility | `patches/0002-buzz-acp-compat.patch` |
+| `tools/environments/local.py` | Buzz ACP compatibility | `patches/0002-buzz-acp-compat.patch` |
+| `tools/tool_search.py` | Buzz ACP compatibility | `_NEVER_DEFER_TOOL_NAMES` |
 | `apps/desktop/src/lib/external-link.tsx` | A bare click on a chat link opens the **system** browser; the in-app preview pane moves to ⌘/Ctrl-click and middle-click. Upstream shipped these swapped in `d07be6e1`. | `wantsInAppBrowser` |
 | `apps/desktop/src/app/right-sidebar/terminal/links.ts` | Same swap for terminal links: ⌘/Ctrl-click → system browser, ⇧⌘ → in-app pane. | `inApp: event.shiftKey` |
 

@@ -1,50 +1,3 @@
-diff --git a/apps/desktop/src/app/right-sidebar/terminal/links.test.ts b/apps/desktop/src/app/right-sidebar/terminal/links.test.ts
-index 76b5e4b9c..9c360aed5 100644
---- a/apps/desktop/src/app/right-sidebar/terminal/links.test.ts
-+++ b/apps/desktop/src/app/right-sidebar/terminal/links.test.ts
-@@ -43,23 +43,24 @@ async function clickLinkIn(text: string, event: MouseEvent) {
- }
- 
- describe('terminal links', () => {
--  it('opens a ⌘-clicked URL in the in-app browser, not the window.open Electron denies', async () => {
-+  // GROK BUILD PATCH: ⌘-click opens the OS browser, not the in-app pane.
-+  it('opens a ⌘-clicked URL in the OS browser, not the window.open Electron denies', async () => {
-     const uri = 'https://example.com/path'
- 
-     expect(await clickLinkIn(uri, new MouseEvent('click', { metaKey: true }))).toBe(uri)
--    expect(openExternal).not.toHaveBeenCalled()
--    await vi.waitFor(() => expect($previewTabs.get().at(-1)?.target.url).toBe(uri))
-+    expect(openExternal).toHaveBeenCalledWith(uri)
-+    expect($previewTabs.get()).toHaveLength(0)
-   })
- 
--  // The terminal spends ⌘/Ctrl on activation itself, so ⇧ is what escapes to
--  // the OS browser here.
--  it('escapes to the OS browser on ⇧⌘-click', async () => {
-+  // The terminal spends ⌘/Ctrl on activation itself, so ⇧ is what reaches the
-+  // in-app browser here.
-+  it('opens the in-app browser on ⇧⌘-click', async () => {
-     const uri = 'https://example.com/path'
- 
-     await clickLinkIn(uri, new MouseEvent('click', { metaKey: true, shiftKey: true }))
- 
--    expect(openExternal).toHaveBeenCalledWith(uri)
--    expect($previewTabs.get()).toHaveLength(0)
-+    expect(openExternal).not.toHaveBeenCalled()
-+    await vi.waitFor(() => expect($previewTabs.get().at(-1)?.target.url).toBe(uri))
-   })
- 
-   it('leaves a bare click to the selection, so a misclick never launches a browser', async () => {
-@@ -74,7 +75,8 @@ describe('terminal links', () => {
-       start: { x: 1, y: 1 }
-     })
- 
--    await vi.waitFor(() => expect($previewTabs.get().at(-1)?.target.url).toBe('https://example.com/osc8'))
-+    expect(openExternal).toHaveBeenCalledWith('https://example.com/osc8')
-+    expect($previewTabs.get()).toHaveLength(0)
-   })
- })
- 
 diff --git a/apps/desktop/src/app/right-sidebar/terminal/links.ts b/apps/desktop/src/app/right-sidebar/terminal/links.ts
 index cba690fd5..926bbd388 100644
 --- a/apps/desktop/src/app/right-sidebar/terminal/links.ts
@@ -68,53 +21,8 @@ index cba690fd5..926bbd388 100644
    }
  }
  
-diff --git a/apps/desktop/src/lib/external-link.test.tsx b/apps/desktop/src/lib/external-link.test.tsx
-index 3f33f4568..6cd3970a6 100644
---- a/apps/desktop/src/lib/external-link.test.tsx
-+++ b/apps/desktop/src/lib/external-link.test.tsx
-@@ -106,9 +106,9 @@ describe('external link helpers', () => {
-     expect(bridge).toHaveBeenCalledTimes(1)
-   })
- 
--  // A web link belongs in the in-app browser now; the OS browser is the
--  // ⌘/Ctrl-click escape hatch.
--  it('opens a web link in the in-app browser', async () => {
-+  // GROK BUILD PATCH: a web link belongs in the OS browser; the in-app pane is
-+  // the ⌘/Ctrl-click opt-in. (Upstream ships these two swapped.)
-+  it('opens a web link in the OS browser', async () => {
-     const openExternal = vi.fn().mockResolvedValue(undefined)
-     installDesktopBridge({ openExternal: openExternal as unknown as Window['hermesDesktop']['openExternal'] })
- 
-@@ -116,13 +116,13 @@ describe('external link helpers', () => {
- 
-     fireEvent.click(screen.getByRole('link', { name: 'Example link' }))
- 
--    expect(openExternal).not.toHaveBeenCalled()
--    await waitFor(() => expect($previewTabs.get().at(-1)?.target.url).toBe('https://example.com/path/to/resource'))
-+    expect(openExternal).toHaveBeenCalledWith('https://example.com/path/to/resource')
-+    expect($previewTabs.get()).toHaveLength(0)
-   })
- 
-   // Platform-specific on purpose (same rule as terminal links / middle-click):
-   // ⌘ on macOS, Ctrl elsewhere. The suite runs as non-mac.
--  it('escapes to the OS browser on the platform open-elsewhere modifier', () => {
-+  it('opens the in-app browser on the platform open-elsewhere modifier', async () => {
-     const openExternal = vi.fn().mockResolvedValue(undefined)
-     installDesktopBridge({ openExternal: openExternal as unknown as Window['hermesDesktop']['openExternal'] })
- 
-@@ -130,8 +130,8 @@ describe('external link helpers', () => {
- 
-     fireEvent.click(screen.getByRole('link', { name: 'Example link' }), IS_MAC ? { metaKey: true } : { ctrlKey: true })
- 
--    expect(openExternal).toHaveBeenCalledWith('https://example.com/path/to/resource')
--    expect($previewTabs.get()).toHaveLength(0)
-+    expect(openExternal).not.toHaveBeenCalled()
-+    await waitFor(() => expect($previewTabs.get().at(-1)?.target.url).toBe('https://example.com/path/to/resource'))
-   })
- 
-   // A webview can't do anything useful with these, so they always hand off.
 diff --git a/apps/desktop/src/lib/external-link.tsx b/apps/desktop/src/lib/external-link.tsx
-index f586a63a2..6a69d07f9 100644
+index 54a6411d5..c3a6ac1eb 100644
 --- a/apps/desktop/src/lib/external-link.tsx
 +++ b/apps/desktop/src/lib/external-link.tsx
 @@ -203,33 +203,41 @@ export function openExternalLink(href: string): void {
@@ -167,7 +75,7 @@ index f586a63a2..6a69d07f9 100644
      openExternalLink(target)
  
      return
-@@ -293,7 +301,7 @@ export function ExternalLink({
+@@ -296,7 +304,7 @@ export function ExternalLink({
  
          event.preventDefault()
          event.stopPropagation()
@@ -176,7 +84,7 @@ index f586a63a2..6a69d07f9 100644
        }}
        onClick={event => {
          event.stopPropagation()
-@@ -304,7 +312,7 @@ export function ExternalLink({
+@@ -307,7 +315,7 @@ export function ExternalLink({
          }
  
          event.preventDefault()

@@ -293,9 +293,17 @@ spent, you get one clear message instead of a cryptic error.
 Env knobs: `GROK_ACCOUNT_HOMES` (semicolon-separated homes, priority order —
 overrides the `~/.grok`, `~/.grok-b` default) and
 `GROK_ACCOUNT_RETRY_AFTER_MS` (how long a spent account is skipped before
-being re-probed; default 20 minutes) and `GROK_WS_PING_INTERVAL_MS` (WebSocket
+being re-probed; default 20 minutes), `GROK_WS_PING_INTERVAL_MS` (WebSocket
 keepalive; default 20s, matching the uvicorn setting stock Hermes serves
-`/api/ws` with). A re-probe is free — a spent account
+`/api/ws` with), and `GROK_RESUME_PROBE_MS` (how long a resumed turn may stay
+completely silent before the resume id is treated as unloadable; default 90s).
+
+A long-running grok session can reach a size its own CLI can no longer load —
+`grok --resume <id>` then blocks forever with no output and no error, which
+bricks that one chat while new chats work fine. The gateway detects this and
+retries the same message as a fresh grok session instead, so the chat keeps
+working. Your transcript is kept by the gateway and is unaffected; what resets
+is grok's own memory of that conversation. A re-probe is free — a spent account
 returns 402 instantly without consuming balance — so the gateway re-checks
 rather than trying to predict when your weekly balance resets. An account that
 resets picks up the very next message; no restart, no re-login.

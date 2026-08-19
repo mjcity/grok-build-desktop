@@ -334,6 +334,10 @@ function nowSec() {
 // Electron window, so a restart just reconnects to the same doomed retry).
 // 15min comfortably clears that known worst case with margin. A genuinely
 // dead turn still recovers, just slower to detect.
+// How long a --resume turn may stay completely silent before we judge the
+// resume id unloadable rather than slow. See the resume probe in runGrokTurn.
+const RESUME_PROBE_MS = Number(process.env.GROK_RESUME_PROBE_MS || 90_000);
+
 const STALL_TIMEOUT_MS = Number(
   process.env.GROK_STALL_TIMEOUT_MS || 15 * 60 * 1000
 );
@@ -1376,7 +1380,11 @@ function startToolFeed(session, spawnedAtMs, { silent = false, accountHome = nul
   };
 }
 
-function runGrokTurn(session, text, { silent = false, accountHome = null, retryCount = 0 } = {}) {
+function runGrokTurn(
+  session,
+  text,
+  { silent = false, accountHome = null, retryCount = 0, resumeRetried = false } = {}
+) {
   // Resolve which account (config home) this turn runs on. accountHome is set
   // only when we're retrying after a 402 fallback; otherwise pick the active
   // one. If every logged-in account is out of weekly balance, don't spawn a
@@ -1471,6 +1479,33 @@ function runGrokTurn(session, text, { silent = false, accountHome = null, retryC
     if (proc.pid) forceKillPidTree(proc.pid);
   };
 
+  // Resume probe. The stall watchdog is deliberately patient (15 minutes) because
+  // a working turn can think for a long time. That patience is wrong for a resume
+  // that never starts: a dead resume id produces NOTHING — no output, no events,
+  // no stderr — and would hold the chat hostage for the full stall window before
+  // anyone noticed, every single message. So when (and only when) we pass
+  // --resume, give the child a short budget to show ANY sign of life. A healthy
+  // resume of a real session answered in 27s in testing; the default here is well
+  // clear of that. Silence past it means the id is dead, not that the model is
+  // thinking, and the close handler retries the turn without it.
+  let resumeDead = false;
+  // Fed ONLY by real bytes from the child. Deliberately NOT turnActivityAt:
+  // that map is also bumped by our own keepalive's synthetic session.info
+  // re-announcement every ~16-20s, so it always looks busy and silently
+  // disarmed the first version of this probe.
+  let sawGrokOutput = false;
+  const resumeProbe = resumeId
+    ? setTimeout(() => {
+        if (sawGrokOutput) return; // it spoke
+        resumeDead = true;
+        log(
+          `resume probe: session=${session.id.slice(0, 8)} resume=${resumeId} silent for ${RESUME_PROBE_MS}ms — treating the id as unloadable`
+        );
+        killTurnTree();
+      }, RESUME_PROBE_MS)
+    : null;
+  if (resumeProbe && typeof resumeProbe.unref === "function") resumeProbe.unref();
+
   // Stall watchdog: kill only on true silence (see STALL_TIMEOUT_MS comment
   // above), with a generous absolute backstop. Checked periodically rather
   // than a single timer so a turn that goes quiet-then-busy-then-quiet again
@@ -1489,6 +1524,7 @@ function runGrokTurn(session, text, { silent = false, accountHome = null, retryC
       `turn ${autoKillReason} session=${session.id.slice(0, 8)} elapsed=${now - turnStartedAt}ms sinceActivity=${now - lastActivity}ms`
     );
     clearInterval(watchdogTimer);
+    if (resumeProbe) clearTimeout(resumeProbe);
     killTurnTree();
   }, WATCHDOG_INTERVAL_MS);
   if (typeof watchdogTimer.unref === "function") watchdogTimer.unref();
@@ -1523,6 +1559,7 @@ function runGrokTurn(session, text, { silent = false, accountHome = null, retryC
   }
 
   proc.stdout.on("data", (chunk) => {
+    sawGrokOutput = true;
     buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
     let idx;
     while ((idx = buffer.indexOf("\n")) !== -1) {
@@ -1588,6 +1625,7 @@ function runGrokTurn(session, text, { silent = false, accountHome = null, retryC
 
   proc.on("close", (code) => {
     clearInterval(watchdogTimer);
+    if (resumeProbe) clearTimeout(resumeProbe);
 
     // Account fallback: this account's weekly balance is spent. Switch the
     // SAME turn to the next logged-in account and retry, transparently — the
@@ -1622,6 +1660,45 @@ function runGrokTurn(session, text, { silent = false, accountHome = null, retryC
     // This account answered without a 402, so it has balance. Remember it and
     // lead with it next turn.
     if (!sawExhaustion) markAccountWorked(home);
+
+    // Unresumable grok session → retry once WITHOUT --resume.
+    //
+    // A grok session can reach a state its own CLI can no longer load. Observed
+    // 2026-08-19 on a 19MB session (11.7MB updates.jsonl, a 3.9MB pending
+    // compaction request): `grok --resume <id>` blocks forever with zero CPU,
+    // zero stdout and zero stderr. Not slow — blocked; it was still frozen at
+    // the same CPU tick after five minutes. A small session on the same account
+    // resumed fine in 27s, so this is that one session, not the account, the
+    // network, or resume in general.
+    //
+    // Left alone this is permanent: every turn re-sends the same dead resume id,
+    // our stall watchdog kills it a minute later, and the chat is bricked while
+    // brand-new chats work — exactly what the user saw. Nothing on the grok side
+    // ever repairs it.
+    //
+    // So treat "we resumed, and got NOTHING at all within the resume probe" as
+    // proof the id is dead: forget it and immediately re-run the same prompt as a
+    // fresh grok session. The visible transcript is ours and is untouched; what is
+    // lost is grok's own context for this chat, which was unreachable anyway. The
+    // conditions are deliberately narrow — a stall AFTER real output is an
+    // ordinary stall and must keep its normal error, not silently restart.
+    if (resumeDead && !sawExhaustion && !resumeRetried) {
+      log(
+        `unresumable grok session=${session.id.slice(0, 8)} resume=${resumeId} is unloadable — dropping the id and retrying fresh`
+      );
+      delete session.grok_session_ids[home];
+      if (session.grok_session_id === resumeId) session.grok_session_id = null;
+      upsertSession(session);
+      toolFeed.stop();
+      if (!silent) clearTurnKeepalive(session.id);
+      runGrokTurn(session, text, {
+        silent,
+        accountHome: home,
+        retryCount,
+        resumeRetried: true,
+      });
+      return; // the retried turn owns finishing
+    }
 
     let status = "complete";
     if (autoKillReason) {

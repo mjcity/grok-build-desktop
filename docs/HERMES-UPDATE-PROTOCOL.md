@@ -44,6 +44,40 @@ git -C $repo stash pop        # if you stashed and want the patches back
 # relaunch: D:\Program\grok\projects\hermes-agent-fork\grok-gateway\GrokBuild.cmd
 ```
 
+## 1b. Local patch inventory — re-apply every one after the update
+
+Upstream rewrites history, so these never merge cleanly. Treat this list as the
+definition of done: after §4 builds, **grep each marker back** before believing
+the patch survived.
+
+| File (in the Hermes repo) | What we change | Marker to grep |
+|---|---|---|
+| `acp_adapter/session.py` | Buzz ACP compatibility | see `git stash` from §1 |
+| `tools/environments/local.py` | Buzz ACP compatibility | see `git stash` from §1 |
+| `tools/tool_search.py` | Buzz ACP compatibility | see `git stash` from §1 |
+| `apps/desktop/src/lib/external-link.tsx` | A bare click on a chat link opens the **system** browser; the in-app preview pane moves to ⌘/Ctrl-click and middle-click. Upstream shipped these swapped in `d07be6e1`. | `wantsInAppBrowser` |
+| `apps/desktop/src/app/right-sidebar/terminal/links.ts` | Same swap for terminal links: ⌘/Ctrl-click → system browser, ⇧⌘ → in-app pane. | `inApp: event.shiftKey` |
+
+The link patch is checked in as a real patch file, so re-applying it is a
+command, not a retype:
+
+```powershell
+git -C $repo apply --3way "$gateway\patches\0001-links-open-in-system-browser.patch"
+```
+
+It also owns the two test files that assert the routing
+(`external-link.test.tsx`, `terminal/links.test.ts`). If upstream's versions come
+back, the suites fail loudly rather than silently reverting the behavior — that
+is the point. Re-apply, then:
+
+```powershell
+cd "$repo\apps\desktop"; npx vitest run src/lib/external-link.test.tsx src/app/right-sidebar/terminal/links.test.ts
+```
+
+Why this one is a keeper: an embedded webview has none of the user's logins,
+extensions, password manager, or open tabs, so "read this page" quietly became
+"read this page signed out." The pane is still there — it is just opt-in now.
+
 ## 2. Update source on a branch — never advance `main`
 
 ```powershell

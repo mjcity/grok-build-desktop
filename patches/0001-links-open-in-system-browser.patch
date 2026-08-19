@@ -1,0 +1,187 @@
+diff --git a/apps/desktop/src/app/right-sidebar/terminal/links.test.ts b/apps/desktop/src/app/right-sidebar/terminal/links.test.ts
+index 76b5e4b9c..9c360aed5 100644
+--- a/apps/desktop/src/app/right-sidebar/terminal/links.test.ts
++++ b/apps/desktop/src/app/right-sidebar/terminal/links.test.ts
+@@ -43,23 +43,24 @@ async function clickLinkIn(text: string, event: MouseEvent) {
+ }
+ 
+ describe('terminal links', () => {
+-  it('opens a ⌘-clicked URL in the in-app browser, not the window.open Electron denies', async () => {
++  // GROK BUILD PATCH: ⌘-click opens the OS browser, not the in-app pane.
++  it('opens a ⌘-clicked URL in the OS browser, not the window.open Electron denies', async () => {
+     const uri = 'https://example.com/path'
+ 
+     expect(await clickLinkIn(uri, new MouseEvent('click', { metaKey: true }))).toBe(uri)
+-    expect(openExternal).not.toHaveBeenCalled()
+-    await vi.waitFor(() => expect($previewTabs.get().at(-1)?.target.url).toBe(uri))
++    expect(openExternal).toHaveBeenCalledWith(uri)
++    expect($previewTabs.get()).toHaveLength(0)
+   })
+ 
+-  // The terminal spends ⌘/Ctrl on activation itself, so ⇧ is what escapes to
+-  // the OS browser here.
+-  it('escapes to the OS browser on ⇧⌘-click', async () => {
++  // The terminal spends ⌘/Ctrl on activation itself, so ⇧ is what reaches the
++  // in-app browser here.
++  it('opens the in-app browser on ⇧⌘-click', async () => {
+     const uri = 'https://example.com/path'
+ 
+     await clickLinkIn(uri, new MouseEvent('click', { metaKey: true, shiftKey: true }))
+ 
+-    expect(openExternal).toHaveBeenCalledWith(uri)
+-    expect($previewTabs.get()).toHaveLength(0)
++    expect(openExternal).not.toHaveBeenCalled()
++    await vi.waitFor(() => expect($previewTabs.get().at(-1)?.target.url).toBe(uri))
+   })
+ 
+   it('leaves a bare click to the selection, so a misclick never launches a browser', async () => {
+@@ -74,7 +75,8 @@ describe('terminal links', () => {
+       start: { x: 1, y: 1 }
+     })
+ 
+-    await vi.waitFor(() => expect($previewTabs.get().at(-1)?.target.url).toBe('https://example.com/osc8'))
++    expect(openExternal).toHaveBeenCalledWith('https://example.com/osc8')
++    expect($previewTabs.get()).toHaveLength(0)
+   })
+ })
+ 
+diff --git a/apps/desktop/src/app/right-sidebar/terminal/links.ts b/apps/desktop/src/app/right-sidebar/terminal/links.ts
+index cba690fd5..926bbd388 100644
+--- a/apps/desktop/src/app/right-sidebar/terminal/links.ts
++++ b/apps/desktop/src/app/right-sidebar/terminal/links.ts
+@@ -25,13 +25,13 @@ export function isTerminalLinkActivation(
+ }
+ 
+ // The terminal spends the ⌘/Ctrl modifier on activation itself, so it has no
+-// second chord left to mean "native browser" — ⇧ takes that job here. Elsewhere
+-// a bare click opens in-app and ⌘ escapes to the OS; here it's ⌘ to open and
+-// ⇧⌘ to escape, which keeps both gestures reachable without stealing the
+-// selection back from a plain click.
++// second chord left to mean "the other browser" — ⇧ takes that job here.
++// Elsewhere a bare click opens the system browser and ⌘ opens the in-app pane;
++// here it's ⌘ to open and ⇧⌘ for the pane, which keeps both gestures reachable
++// without stealing the selection back from a plain click.
+ const activate = (event: MouseEvent, uri: string) => {
+   if (isTerminalLinkActivation(event)) {
+-    openLink(uri, { native: event.shiftKey })
++    openLink(uri, { inApp: event.shiftKey })
+   }
+ }
+ 
+diff --git a/apps/desktop/src/lib/external-link.test.tsx b/apps/desktop/src/lib/external-link.test.tsx
+index 3f33f4568..6cd3970a6 100644
+--- a/apps/desktop/src/lib/external-link.test.tsx
++++ b/apps/desktop/src/lib/external-link.test.tsx
+@@ -106,9 +106,9 @@ describe('external link helpers', () => {
+     expect(bridge).toHaveBeenCalledTimes(1)
+   })
+ 
+-  // A web link belongs in the in-app browser now; the OS browser is the
+-  // ⌘/Ctrl-click escape hatch.
+-  it('opens a web link in the in-app browser', async () => {
++  // GROK BUILD PATCH: a web link belongs in the OS browser; the in-app pane is
++  // the ⌘/Ctrl-click opt-in. (Upstream ships these two swapped.)
++  it('opens a web link in the OS browser', async () => {
+     const openExternal = vi.fn().mockResolvedValue(undefined)
+     installDesktopBridge({ openExternal: openExternal as unknown as Window['hermesDesktop']['openExternal'] })
+ 
+@@ -116,13 +116,13 @@ describe('external link helpers', () => {
+ 
+     fireEvent.click(screen.getByRole('link', { name: 'Example link' }))
+ 
+-    expect(openExternal).not.toHaveBeenCalled()
+-    await waitFor(() => expect($previewTabs.get().at(-1)?.target.url).toBe('https://example.com/path/to/resource'))
++    expect(openExternal).toHaveBeenCalledWith('https://example.com/path/to/resource')
++    expect($previewTabs.get()).toHaveLength(0)
+   })
+ 
+   // Platform-specific on purpose (same rule as terminal links / middle-click):
+   // ⌘ on macOS, Ctrl elsewhere. The suite runs as non-mac.
+-  it('escapes to the OS browser on the platform open-elsewhere modifier', () => {
++  it('opens the in-app browser on the platform open-elsewhere modifier', async () => {
+     const openExternal = vi.fn().mockResolvedValue(undefined)
+     installDesktopBridge({ openExternal: openExternal as unknown as Window['hermesDesktop']['openExternal'] })
+ 
+@@ -130,8 +130,8 @@ describe('external link helpers', () => {
+ 
+     fireEvent.click(screen.getByRole('link', { name: 'Example link' }), IS_MAC ? { metaKey: true } : { ctrlKey: true })
+ 
+-    expect(openExternal).toHaveBeenCalledWith('https://example.com/path/to/resource')
+-    expect($previewTabs.get()).toHaveLength(0)
++    expect(openExternal).not.toHaveBeenCalled()
++    await waitFor(() => expect($previewTabs.get().at(-1)?.target.url).toBe('https://example.com/path/to/resource'))
+   })
+ 
+   // A webview can't do anything useful with these, so they always hand off.
+diff --git a/apps/desktop/src/lib/external-link.tsx b/apps/desktop/src/lib/external-link.tsx
+index f586a63a2..6a69d07f9 100644
+--- a/apps/desktop/src/lib/external-link.tsx
++++ b/apps/desktop/src/lib/external-link.tsx
+@@ -203,33 +203,41 @@ export function openExternalLink(href: string): void {
+ }
+ 
+ /**
+- * True when a click asked for the SYSTEM browser — ⌘ on macOS, Ctrl elsewhere,
++ * GROK BUILD PATCH (see docs/HERMES-UPDATE-PROTOCOL.md).
++ *
++ * Upstream made the in-app browser the destination for a bare click and put the
++ * real browser behind ⌘/Ctrl. We swap the two back: a bare click goes to the
++ * system browser, because that is where the user's logged-in sessions, password
++ * manager, extensions and open tabs already are, and it is what this app did
++ * before the change. The in-app pane is kept, just demoted to the modifier.
++ *
++ * True when a click asked for the IN-APP browser — ⌘ on macOS, Ctrl elsewhere,
+  * the modifier every app uses for "open this somewhere else". Middle-click
+  * counts too: it is the other half of the same convention.
+  */
+-export function wantsNativeBrowser(event: Pick<MouseEvent, 'button' | 'ctrlKey' | 'metaKey'>): boolean {
++export function wantsInAppBrowser(event: Pick<MouseEvent, 'button' | 'ctrlKey' | 'metaKey'>): boolean {
+   return event.button === 1 || (IS_MAC ? event.metaKey : event.ctrlKey)
+ }
+ 
+ /**
+  * Where a link the user clicked should open.
+  *
+- * A web page opens in the in-app browser — that pane exists so reading a doc
+- * doesn't cost a context switch out of Hermes, and it is the surface the agent
+- * can see. ⌘/Ctrl-click (or middle-click) escapes to the real browser, which is
+- * where you go for anything needing your logged-in session or a password.
++ * A web page opens in the SYSTEM browser — that is where the user's logins,
++ * extensions and tabs live, and a page that wants a password has no business in
++ * an embedded webview. Pass `inApp` (⌘/Ctrl-click, or middle-click) to read it
++ * in the preview pane instead, without a context switch out of the app.
+  *
+  * Everything that ISN'T a web page — `mailto:`, `file:`, a custom scheme — has
+  * no business in the webview and always hands off to the OS.
+  */
+-export function openLink(href: string, options: { native?: boolean } = {}): void {
++export function openLink(href: string, options: { inApp?: boolean } = {}): void {
+   const target = normalizeExternalUrl(href)
+ 
+   if (!target) {
+     return
+   }
+ 
+-  if (options.native || !/^https?:$/i.test(parseUrl(target)?.protocol ?? '')) {
++  if (!options.inApp || !/^https?:$/i.test(parseUrl(target)?.protocol ?? '')) {
+     openExternalLink(target)
+ 
+     return
+@@ -293,7 +301,7 @@ export function ExternalLink({
+ 
+         event.preventDefault()
+         event.stopPropagation()
+-        openExternalLink(target)
++        openLink(target, { inApp: true })
+       }}
+       onClick={event => {
+         event.stopPropagation()
+@@ -304,7 +312,7 @@ export function ExternalLink({
+         }
+ 
+         event.preventDefault()
+-        openLink(target, { native: wantsNativeBrowser(event.nativeEvent) })
++        openLink(target, { inApp: wantsInAppBrowser(event.nativeEvent) })
+       }}
+       rel="noopener noreferrer"
+       target="_blank"

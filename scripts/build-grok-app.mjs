@@ -136,8 +136,20 @@ function fileFingerprint(p) {
 }
 
 const sourceCommit = readInstallCommit(sourceDir);
+// The commit alone is NOT enough to decide "already built". We deliberately
+// carry local patches on top of the pinned Hermes commit (see
+// docs/HERMES-UPDATE-PROTOCOL.md §1b), so a rebuilt win-unpacked can differ
+// while the commit stays identical - and this script would happily skip the
+// copy and leave the OLD exe installed, which is exactly what happened on
+// 2026-08-18 with the link-routing patch. electron-builder rewrites
+// resources/app.asar on every package run, so its mtime+size is a cheap,
+// precise "this is a different build" signal that a patch cannot slip past.
+const sourceBuild = fileFingerprint(
+  path.join(sourceDir, "resources", "app.asar")
+);
 const wantStamp = JSON.stringify({
   sourceCommit,
+  sourceBuild,
   icon: fileFingerprint(iconPath),
   appIcon: appIconPngPath ? fileFingerprint(appIconPngPath) : null,
 });

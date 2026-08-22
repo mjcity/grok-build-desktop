@@ -1059,6 +1059,13 @@ function filterSessions(params) {
 
 /** @type {Set<import('ws').WebSocket>} */
 const sockets = new Set();
+
+// Per-method throttle for the inbound RPC trace above. prompt.submit bypasses it
+// - that one is never noise, and it is the exact frame we need to see or not see.
+const rpcTraceAt = new Map();
+const RPC_TRACE_EVERY_MS = Number(
+  process.env.GROK_RPC_TRACE_EVERY_MS || 60_000
+);
 /** @type {Map<string, { cancel: () => void }>} */
 const activeTurns = new Map();
 /** @type {Map<string, string[]>} */
@@ -2585,6 +2592,29 @@ wss.on("connection", (ws) => {
     // App-LEVEL liveness (see the idle reaper below). Distinct from ws.isAlive,
     // which only proves the network process is answering pings.
     ws.lastAppFrameAt = Date.now();
+
+    // Inbound method trace. Added 2026-08-22 after two wrong theories about the
+    // idle wedge in a row: the ping keepalive could not see it (Chromium answers
+    // pings in the network process), and the app-idle reaper never fired even
+    // once because the client keeps polling while wedged. Both were guesses about
+    // a signal nobody had actually measured. This records what the client really
+    // says, so the next occurrence is read off the log instead of theorised about
+    // - in particular whether prompt.submit arrives at all. Rate-limited per
+    // method so a chatty poller cannot flood the file.
+    try {
+      const peeked = JSON.parse(String(raw));
+      const m = String(peeked?.method || "?");
+      const now = Date.now();
+      const last = rpcTraceAt.get(m) || 0;
+      if (now - last > RPC_TRACE_EVERY_MS || m === "prompt.submit") {
+        rpcTraceAt.set(m, now);
+        const sid = peeked?.params?.session_id;
+        log(`rpc in: ${m}${sid ? ` session=${String(sid).slice(0, 8)}` : ""}`);
+      }
+    } catch {
+      // Not JSON - the real parse below reports it.
+    }
+
     let msg;
     try {
       msg = JSON.parse(String(raw));
@@ -2804,6 +2834,46 @@ wss.on("connection", (ws) => {
           return;
         }
 
+        // The authoritative "what is actually running right now" snapshot.
+        //
+        // Desktop calls this after every reconnect, and it is the ONLY repair for
+        // a turn whose `running: false` edge was emitted while the socket was
+        // down. Upstream says so in use-background-sync.ts: events emitted while
+        // Desktop is disconnected "cannot be replayed", and the snapshot is
+        // "authoritative about ABSENCE too" - a session missing from this list is
+        // reaped back to idle.
+        //
+        // We answered -32601 here, and Desktop's caller swallows the error and
+        // leaves the sidebar untouched. So a turn that ended during a reconnect
+        // left the session pinned "working" forever: the composer refuses to
+        // submit while it believes a turn is in flight, the typed message bounces
+        // back, and only restarting the app (which rebuilds the store) cleared it.
+        // That is the idle wedge, and the exact sequence is in the 2026-08-22 log
+        // - turn start 20:52:30, ws close 20:55:52, reconnect 20:57:21, turn end
+        // 21:07:27 with nobody listening.
+        //
+        // Report ONLY genuinely running visible turns. Silent reflection turns are
+        // deliberately invisible everywhere else (no session.info either), so
+        // listing them here would paint a spinner the user cannot explain or stop.
+        // Everything omitted is correctly reaped to idle - that absence is the fix.
+        case "session.active_list": {
+          const sessions = [];
+          for (const [id, turn] of activeTurns) {
+            if (turn && turn.silent) continue;
+            const sess = getSession(id);
+            if (!sess) continue;
+            // Both ids are required - Desktop `continue`s past any entry missing
+            // either one, which would silently make this a no-op.
+            sessions.push({
+              id: sess.id,
+              session_key: sess.id,
+              status: "working",
+              last_active: nowSec(),
+            });
+          }
+          return ok({ sessions });
+        }
+
         case "session.usage": {
           const session = getSession(params.session_id);
           if (!session) return err(4001, "session not found");
@@ -3012,22 +3082,15 @@ const WS_PING_INTERVAL_MS = Number(
   process.env.GROK_WS_PING_INTERVAL_MS || 20_000
 );
 
-// App-level idle reap — the half of "is the client alive?" that pings cannot answer.
-//
-// A WebSocket ping is answered by Chromium's NETWORK process, not by the renderer.
-// So when the renderer's side wedges, the ping keepalive above sees a flawless
-// socket: pongs on time, TCP ESTABLISHED at both ends, connection hours old. The
-// UI still draws and still accepts typing, but the message never reaches us —
-// confirmed 2026-08-22, when a socket had been "healthy" for 3h45m with no turn
-// since 05:30 while a freshly-connected client got a reply from the same gateway
-// in 41s. Restarting the app was the only cure.
-//
-// Inbound frames are the signal that survives that failure, because they can only
-// come FROM the renderer. If a socket has sent us nothing at the application level
-// for this long, close it: the desktop treats a close as a reconnect trigger (it
-// does this all day already — every sleep/wake cycle in the log), and the fresh
-// socket comes back working. Closing a merely-idle-but-healthy socket costs one
-// reconnect and nothing else, which is why this is safe to do on suspicion.
+// App-level idle reap — a backstop for a renderer that has stopped talking
+// entirely. NOT the fix for the 2026-08-22 idle wedge: I built it believing
+// inbound silence marked a wedged renderer, and it never fired once, because
+// Desktop polls `pet.info` every ~60s the whole time it is stuck. The real cause
+// was `session.active_list` returning -32601 (see that case above). Keeping this
+// only for the case it genuinely covers — a renderer that goes completely quiet,
+// where a close lets the desktop rebuild a working socket. Never reaps mid-turn:
+// a long turn is legitimately one-way traffic and cutting it would drop the
+// stream the user is watching.
 const WS_APP_IDLE_MS = Number(process.env.GROK_WS_APP_IDLE_MS || 10 * 60 * 1000);
 
 const wsKeepalive = setInterval(() => {

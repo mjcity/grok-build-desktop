@@ -86,11 +86,18 @@ the patch survived.
 
 | File (in the Hermes repo) | What we change | Marker to grep |
 |---|---|---|
-| `acp_adapter/session.py` | Buzz ACP compatibility | `patches/0002-buzz-acp-compat.patch` |
+| `acp_adapter/session.py` | Buzz ACP compatibility — **needs rework**, see below | `patches/0002-buzz-acp-compat.patch.needs-rework` |
 | `tools/environments/local.py` | Buzz ACP compatibility | `patches/0002-buzz-acp-compat.patch` |
-| `tools/tool_search.py` | Buzz ACP compatibility | `_NEVER_DEFER_TOOL_NAMES` |
+| `tools/tool_search.py` | Buzz ACP compatibility — **needs rework** | `_NEVER_DEFER_TOOL_NAMES` |
 | `apps/desktop/src/lib/external-link.tsx` | A bare click on a chat link opens the **system** browser; the in-app preview pane moves to ⌘/Ctrl-click and middle-click. Upstream shipped these swapped in `d07be6e1`. | `wantsInAppBrowser` |
 | `apps/desktop/src/app/right-sidebar/terminal/links.ts` | Same swap for terminal links: ⌘/Ctrl-click → system browser, ⇧⌘ → in-app pane. | `inApp: event.shiftKey` |
+
+> **Buzz patches parked at `13f4cfeb` (2026-08-22).** All three conflict with
+> upstream's rewrite of those files, and none of the changes were adopted
+> upstream — so Buzz Desktop still needs them. The file is renamed to
+> `.needs-rework` so the repair script (which globs `*.patch`) skips it loudly
+> rather than dropping it silently. They affect **Buzz, not Grok Build**, so Grok
+> Build is unaffected; rework them before relying on Buzz's ACP path again.
 
 The link patch is checked in as a real patch file, so re-applying it is a
 command, not a retype:

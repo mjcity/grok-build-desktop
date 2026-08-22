@@ -2569,6 +2569,7 @@ wss.on("connection", (ws) => {
   // Liveness for the keepalive sweep below. A peer that answers our ping flips
   // this back to true; one that doesn't gets reaped on the next tick.
   ws.isAlive = true;
+  ws.lastAppFrameAt = Date.now();
   ws.on("pong", () => {
     ws.isAlive = true;
   });
@@ -2581,6 +2582,9 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("message", (raw) => {
+    // App-LEVEL liveness (see the idle reaper below). Distinct from ws.isAlive,
+    // which only proves the network process is answering pings.
+    ws.lastAppFrameAt = Date.now();
     let msg;
     try {
       msg = JSON.parse(String(raw));
@@ -3008,8 +3012,45 @@ const WS_PING_INTERVAL_MS = Number(
   process.env.GROK_WS_PING_INTERVAL_MS || 20_000
 );
 
+// App-level idle reap — the half of "is the client alive?" that pings cannot answer.
+//
+// A WebSocket ping is answered by Chromium's NETWORK process, not by the renderer.
+// So when the renderer's side wedges, the ping keepalive above sees a flawless
+// socket: pongs on time, TCP ESTABLISHED at both ends, connection hours old. The
+// UI still draws and still accepts typing, but the message never reaches us —
+// confirmed 2026-08-22, when a socket had been "healthy" for 3h45m with no turn
+// since 05:30 while a freshly-connected client got a reply from the same gateway
+// in 41s. Restarting the app was the only cure.
+//
+// Inbound frames are the signal that survives that failure, because they can only
+// come FROM the renderer. If a socket has sent us nothing at the application level
+// for this long, close it: the desktop treats a close as a reconnect trigger (it
+// does this all day already — every sleep/wake cycle in the log), and the fresh
+// socket comes back working. Closing a merely-idle-but-healthy socket costs one
+// reconnect and nothing else, which is why this is safe to do on suspicion.
+const WS_APP_IDLE_MS = Number(process.env.GROK_WS_APP_IDLE_MS || 10 * 60 * 1000);
+
 const wsKeepalive = setInterval(() => {
   for (const ws of [...sockets]) {
+    // Never reap while work is in flight: a long turn is legitimately one-way
+    // traffic (we stream events out, the client says nothing back), and cutting
+    // the socket there would drop the stream the user is watching.
+    if (
+      activeTurns.size === 0 &&
+      ws.lastAppFrameAt &&
+      Date.now() - ws.lastAppFrameAt > WS_APP_IDLE_MS
+    ) {
+      log(
+        `ws app-idle: no client frame in ${Math.round((Date.now() - ws.lastAppFrameAt) / 1000)}s — closing so the desktop reconnects`
+      );
+      ws.lastAppFrameAt = Date.now(); // don't re-fire before the close lands
+      try {
+        ws.close(1000, "idle");
+      } catch {
+        ws.terminate();
+      }
+      continue;
+    }
     if (ws.isAlive === false) {
       // Missed the whole interval since the last ping — treat as gone. terminate()
       // (not close()) because a half-open socket will never complete a closing

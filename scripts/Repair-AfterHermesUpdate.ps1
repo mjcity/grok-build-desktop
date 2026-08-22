@@ -69,13 +69,28 @@ Step "Re-apply local patches"
 Get-ChildItem (Join-Path $gateway 'patches\*.patch') | Sort-Object Name | ForEach-Object {
   # --reverse --check succeeding means it is ALREADY applied; skip rather than
   # doubling it up.
-  & git -C $HermesRepo apply --check --reverse $_.FullName 2>$null
-  if ($LASTEXITCODE -eq 0) {
+  # git writes to stderr on a failed --check, and PowerShell 5.1 turns native
+  # stderr into ErrorRecords that terminate under $ErrorActionPreference='Stop'
+  # - so a NORMAL "not yet applied" probe killed this script. Relax the
+  # preference around every git call and judge by $LASTEXITCODE, same as
+  # Invoke-Native does for npm.
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    & git -C $HermesRepo apply --check --reverse $_.FullName 2>&1 | Out-Null
+    $alreadyApplied = ($LASTEXITCODE -eq 0)
+    if (-not $alreadyApplied) {
+      & git -C $HermesRepo apply --3way $_.FullName 2>&1 | Out-Null
+      $applied = ($LASTEXITCODE -eq 0)
+    }
+  } finally { $ErrorActionPreference = $prev }
+
+  if ($alreadyApplied) {
     Write-Host "  $($_.Name): already applied"
-  } else {
-    & git -C $HermesRepo apply --3way $_.FullName
-    if ($LASTEXITCODE -ne 0) { Fail "$($_.Name) did not apply - re-do it by hand, then re-export it" }
+  } elseif ($applied) {
     Write-Host "  $($_.Name): applied"
+  } else {
+    Fail "$($_.Name) did not apply - re-do it by hand, then re-export it"
   }
 }
 

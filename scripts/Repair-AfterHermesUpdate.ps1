@@ -132,4 +132,19 @@ $hits = (Select-String -Path $link.FullName -Pattern 'inApp' -AllMatches |
 Write-Host "  $($link.Name): inApp x$hits"
 if (-not $hits) { Fail 'link patch is NOT in the installed bundle' }
 
+# Taskbar identity - verify the INSTALLED main bundle, independently of
+# build-grok-app.mjs's own exit-4 gate. On 2026-08-24 the identity patch missed
+# (bundler renamed `app` -> `app3`), the copy shipped declaring Hermes's own
+# AppUserModelID, and Windows merged Grok Build onto stock Hermes's taskbar
+# button. Two layers of verification because one silent miss already happened.
+$mainMjs = Join-Path $GrokAppDir 'resources\app.asar.unpacked\dist\electron-main.mjs'
+if (-not (Test-Path $mainMjs)) { Fail "no electron-main.mjs under $GrokAppDir" }
+$mainSrc = [System.IO.File]::ReadAllText($mainMjs)
+$stockId = $mainSrc.Contains('setAppUserModelId("com.nousresearch.hermes")')
+$grokId  = $mainSrc.Contains('setAppUserModelId("com.mjcity.grokbuild")')
+Write-Host "  identity: grok AUMID=$grokId stock AUMID=$stockId"
+if ($stockId -or -not $grokId) {
+  Fail 'installed copy still declares stock Hermes identity - taskbar buttons would merge'
+}
+
 Write-Host "`nRepaired. Launch with GrokBuild.cmd" -ForegroundColor Green

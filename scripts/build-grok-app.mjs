@@ -260,24 +260,35 @@ const mainMjs = path.join(
 );
 if (fs.existsSync(mainMjs)) {
   let src = fs.readFileSync(mainMjs, "utf8");
-  const aumidHits = src.split('app.setAppUserModelId("com.nousresearch.hermes")').length - 1;
+  // The bundler renames `app` per build (app, app2, app3, ...), so NEVER match
+  // the receiver literally. On 2026-08-24 the exact-string version of this
+  // patch silently missed `app3.setAppUserModelId(...)`, shipped anyway, and
+  // the installed copy declared Hermes's own AppUserModelID - Windows merged
+  // Grok Build onto stock Hermes's taskbar button, undoing the whole identity
+  // layer while every log line still said success. Capture whatever receiver
+  // the bundle uses and reuse it for the injected title-lock too.
+  const aumidRe = /([A-Za-z_$][\w$]*)\.setAppUserModelId\("com\.nousresearch\.hermes"\)/;
+  const aumidMatch = src.match(aumidRe);
   const titleHits = src.split('title: "Hermes"').length - 1;
-  if (aumidHits > 0 || titleHits > 0) {
-    src = src
-      .split('app.setAppUserModelId("com.nousresearch.hermes")')
-      .join('app.setAppUserModelId("com.mjcity.grokbuild")');
+  if (aumidMatch || titleHits > 0) {
+    const appVar = aumidMatch ? aumidMatch[1] : "app";
+    if (aumidMatch) {
+      src = src
+        .split(appVar + '.setAppUserModelId("com.nousresearch.hermes")')
+        .join(appVar + '.setAppUserModelId("com.mjcity.grokbuild")');
+    }
     src = src.split('title: "Hermes"').join('title: "Grok Build"');
     // The BrowserWindow `title:` option alone is not enough: once the
     // renderer loads, Electron mirrors document.title ("Hermes") back onto
     // the window unless page-title-updated is prevented. Idempotency marker
-    // is our own setTitle call — do NOT key on "page-title-updated", Hermes
+    // is our own setTitle call - do NOT key on "page-title-updated", Hermes
     // has an unrelated listener with that name (scheduleGrace).
-    if (!src.includes('win.setTitle("Grok Build")')) {
-      const anchor = 'app.setAppUserModelId("com.mjcity.grokbuild");';
+    if (aumidMatch && !src.includes('win.setTitle("Grok Build")')) {
+      const anchor = appVar + '.setAppUserModelId("com.mjcity.grokbuild");';
       src = src.replace(
         anchor,
         anchor +
-          '\n  app.on("browser-window-created", (_ev, win) => {\n' +
+          `\n  ${appVar}.on("browser-window-created", (_ev, win) => {\n` +
           '    win.on("page-title-updated", (e) => e.preventDefault());\n' +
           '    win.setTitle("Grok Build");\n' +
           "  });"
@@ -340,12 +351,29 @@ if (fs.existsSync(mainMjs)) {
     }
     fs.writeFileSync(mainMjs, src);
     console.log(
-      `[build-grok-app] patched app identity (AppUserModelID x${aumidHits}, window title x${titleHits} + title lock, icon path priority) - distinct taskbar identity`
+      `[build-grok-app] patched app identity (AppUserModelID ${aumidMatch ? `via ${aumidMatch[1]}` : "NOT FOUND"}, window title x${titleHits} + title lock, icon path priority) - distinct taskbar identity`
     );
-  } else if (!src.includes("com.mjcity.grokbuild")) {
+  }
+
+  // Identity gate - fail the BUILD, not just a log line. The 2026-08-24 miss
+  // proved a warning is worthless here: the copy shipped with Hermes's own
+  // AppUserModelID, Windows merged the taskbar buttons, and nothing in the
+  // output said so. If the written file still declares the stock identity (or
+  // never gained ours), refuse to hand this copy to the launcher; GrokBuild.cmd
+  // then falls back to launching stock Hermes openly, which is at least honest
+  // about what it is.
+  const finalSrc = fs.readFileSync(mainMjs, "utf8");
+  if (
+    finalSrc.includes('setAppUserModelId("com.nousresearch.hermes")') ||
+    !finalSrc.includes('setAppUserModelId("com.mjcity.grokbuild")')
+  ) {
     console.error(
-      "[build-grok-app] WARNING: neither the stock AUMID nor the patched one found in electron-main.mjs - upstream Hermes may have changed how it sets AppUserModelId; taskbar buttons may merge with stock Hermes again"
+      "[build-grok-app] FATAL: identity patch did not land - electron-main.mjs still declares stock Hermes's AppUserModelID (upstream bundle shape changed?). Refusing to ship a copy that would merge onto Hermes's taskbar button."
     );
+    try {
+      fs.unlinkSync(stampFile);
+    } catch {}
+    process.exit(4);
   }
 } else {
   console.error(

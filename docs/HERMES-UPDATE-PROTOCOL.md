@@ -129,6 +129,28 @@ git -C $repo checkout -b "update-$(Get-Date -Format yyyyMMdd)" origin/main
 `main` stays at the last verified commit as the rollback anchor. Only move
 `main` forward AFTER §7 fully passes (`git branch -f main <new-sha>`).
 
+## 2b. Upstream squashes history — do not trust `behind N`
+
+Since 2026-09 `origin/main` is a single root commit, rewritten every push.
+`git rev-list --count HEAD..origin/main` reports 1 no matter how much changed
+(the 2026-09-08 update was "1 commit" and 5,914 files). Read the change from
+CONTENT, not lineage:
+
+```powershell
+git -C $repo diff --stat <last-tested-sha> origin/main | Select-Object -Last 1
+git -C $repo diff --stat <last-tested-sha> origin/main -- apps\desktop\electron\main.ts tui_gateway\server.py apps\desktop\src\lib\external-link.tsx
+```
+
+Feature discovery: diff the desktop directory list and the RPC/event names the
+desktop calls between the two shas (see the 2026-09-08 commit message for the
+exact greps). The `<last-tested-sha>` object stays in the local repo even
+after the rewrite, so the diff works as long as you never `git gc --prune`.
+
+Identity layer 4 note: upstream replaced the `APP_ICON_PATHS` array with an
+`appIconCandidates()` function; the patcher handles both shapes, and the repair
+script now hash-verifies the installed `resources\icon.ico` — the file the
+Windows window actually reads — rather than trusting the patch log.
+
 ## 3. Contract-drift scan (before building — know what you're walking into)
 
 ```powershell

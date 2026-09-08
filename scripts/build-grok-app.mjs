@@ -333,9 +333,37 @@ if (fs.existsSync(mainMjs)) {
         );
       }
     } else if (!iconOrderMatch) {
-      console.error(
-        "[build-grok-app] WARNING: APP_ICON_PATHS not found in electron-main.mjs - upstream layout changed; the live window icon will fall back to the stock icon"
-      );
+      // 2026-09-08: upstream moved the list into `appIconCandidates(opts)`
+      // (electron/app-icon.ts) - a function returning the array, so the
+      // `var APP_ICON_PATHS = [...]` regex has nothing to match. Same intent as
+      // above, new anchor: prepend our unpacked png as the first candidate
+      // inside the returned array. The bundler's `path` alias and the
+      // destructured unpackedPathFor name both drift, so read them from the
+      // function body instead of hardcoding.
+      const fnRe = /function appIconCandidates\(opts\) \{\n([\s\S]*?)\n\}/;
+      const fnMatch = src.match(fnRe);
+      const FN_MARKER = "GROK_BUILD_ICON_FIRST";
+      if (fnMatch && !src.includes(FN_MARKER)) {
+        const body = fnMatch[1];
+        const alias = body.match(/(\w+)\.join\(/)?.[1];
+        const unpackedFn = body.match(/unpackedPathFor: (\w+)/)?.[1] || "unpackedPathFor";
+        if (alias && body.includes("return [\n")) {
+          const patchedBody = body.replace(
+            "return [\n",
+            `return [\n    /* ${FN_MARKER} */ ${alias}.join(${unpackedFn}(appRoot), "dist", "apple-touch-icon.png"),\n`
+          );
+          src = src.replace(fnRe, `function appIconCandidates(opts) {\n${patchedBody}\n}`);
+          console.log("[build-grok-app] icon path priority patched via appIconCandidates()");
+        } else {
+          console.error(
+            "[build-grok-app] WARNING: appIconCandidates() found but its body shape is unfamiliar - live window icon relies on the resources/icon.ico swap alone"
+          );
+        }
+      } else if (!fnMatch) {
+        console.error(
+          "[build-grok-app] WARNING: neither APP_ICON_PATHS nor appIconCandidates() found in electron-main.mjs - upstream layout changed; the live window icon relies on the resources/icon.ico swap alone"
+        );
+      }
     }
     // Windows-only (new upstream 40e0e7ad): the icon list now starts with
     // resources/icon.ico, which Electron ALSO uses for the window icon. Even

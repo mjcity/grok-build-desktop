@@ -3038,6 +3038,17 @@ wss.on("connection", (ws) => {
               count: session.attached_images.length,
             });
           }
+          // Log what we refuse, throttled like the inbound trace. Without this
+          // the 2026-08-22 wedge hid for weeks: a method we did not implement
+          // looked identical in the log to one that was never called.
+          {
+            const key = `unknown:${method}`;
+            const now = Date.now();
+            if (now - (rpcTraceAt.get(key) || 0) > RPC_TRACE_EVERY_MS) {
+              rpcTraceAt.set(key, now);
+              log(`rpc unknown method: ${method}`);
+            }
+          }
           err(-32601, `Unknown method: ${method}`);
           return;
         }

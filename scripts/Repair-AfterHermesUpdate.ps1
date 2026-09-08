@@ -147,4 +147,18 @@ if ($stockId -or -not $grokId) {
   Fail 'installed copy still declares stock Hermes identity - taskbar buttons would merge'
 }
 
+# Live window icon. On Windows the first icon candidate is resources\icon.ico,
+# so the swap of that one file is what the running window actually shows -
+# verify by hash against our asset, not by trusting the patcher's log line.
+# (2026-09-08: the APP_ICON_PATHS array patch silently missed after upstream
+# turned it into appIconCandidates(); the icon was still right ONLY because
+# this file had been replaced. Check the thing the OS reads.)
+$ico = Join-Path $GrokAppDir 'resources\icon.ico'
+$ours = Join-Path $gateway 'docs\assets\grok-build-icon.ico'
+if (-not (Test-Path $ico)) { Fail "no resources\icon.ico under $GrokAppDir" }
+$icoHash = (Get-FileHash $ico -Algorithm SHA256).Hash
+$ourHash = (Get-FileHash $ours -Algorithm SHA256).Hash
+Write-Host "  window icon: $(if ($icoHash -eq $ourHash) { 'Grok Build' } else { 'NOT ours' })"
+if ($icoHash -ne $ourHash) { Fail 'installed resources\icon.ico is not the Grok Build icon - live window would show stock Hermes' }
+
 Write-Host "`nRepaired. Launch with GrokBuild.cmd" -ForegroundColor Green

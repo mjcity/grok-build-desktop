@@ -67,10 +67,10 @@ index cba690fd5..926bbd388 100644
  }
  
 diff --git a/apps/desktop/src/lib/external-link.test.tsx b/apps/desktop/src/lib/external-link.test.tsx
-index 653769c4a..46f023f5a 100644
+index 4b4eb25e1..719d30474 100644
 --- a/apps/desktop/src/lib/external-link.test.tsx
 +++ b/apps/desktop/src/lib/external-link.test.tsx
-@@ -107,9 +107,9 @@ describe('external link helpers', () => {
+@@ -108,9 +108,9 @@ describe('external link helpers', () => {
      expect(bridge).toHaveBeenCalledTimes(1)
    })
  
@@ -79,11 +79,11 @@ index 653769c4a..46f023f5a 100644
 -  it('opens a web link in the in-app browser', async () => {
 +  // GROK BUILD PATCH: a web link belongs in the OS browser; the in-app pane is
 +  // the ⌘/Ctrl-click opt-in. (Upstream ships these two swapped.)
-+  it('opens a web link in the OS browser', async () => {
++  it('opens a web link in the OS browser', () => {
      const openExternal = vi.fn().mockResolvedValue(undefined)
      installDesktopBridge({ openExternal: openExternal as unknown as Window['hermesDesktop']['openExternal'] })
  
-@@ -117,13 +117,13 @@ describe('external link helpers', () => {
+@@ -118,13 +118,13 @@ describe('external link helpers', () => {
  
      fireEvent.click(screen.getByRole('link', { name: 'Example link' }))
  
@@ -100,7 +100,7 @@ index 653769c4a..46f023f5a 100644
      const openExternal = vi.fn().mockResolvedValue(undefined)
      installDesktopBridge({ openExternal: openExternal as unknown as Window['hermesDesktop']['openExternal'] })
  
-@@ -131,8 +131,8 @@ describe('external link helpers', () => {
+@@ -132,8 +132,8 @@ describe('external link helpers', () => {
  
      fireEvent.click(screen.getByRole('link', { name: 'Example link' }), IS_MAC ? { metaKey: true } : { ctrlKey: true })
  
@@ -110,46 +110,29 @@ index 653769c4a..46f023f5a 100644
 +    await waitFor(() => expect($previewTabs.get().at(-1)?.target.url).toBe('https://example.com/path/to/resource'))
    })
  
-   // A setup step sends you to a console you are signed into in your own
+   it('treats only the HUD renderer as a native-link surface', () => {
 diff --git a/apps/desktop/src/lib/external-link.tsx b/apps/desktop/src/lib/external-link.tsx
-index 0af32238e..1cc03bebf 100644
+index f4bd0aa53..b932f8b68 100644
 --- a/apps/desktop/src/lib/external-link.tsx
 +++ b/apps/desktop/src/lib/external-link.tsx
-@@ -203,33 +203,40 @@ export function openExternalLink(href: string): void {
- }
- 
- /**
-- * True when a click asked for the SYSTEM browser — ⌘ on macOS, Ctrl elsewhere,
-+ * GROK BUILD PATCH (see docs/HERMES-UPDATE-PROTOCOL.md §1b).
-+ *
-+ * Upstream sends a bare click to the in-app browser and puts the real browser
-+ * behind ⌘/Ctrl. We swap the two back: a bare click goes to the system browser,
-+ * because that is where the user's logins, extensions, password manager and open
-+ * tabs already are. The in-app pane is kept, demoted to the modifier.
-+ *
-+ * True when a click asked for the IN-APP browser — ⌘ on macOS, Ctrl elsewhere,
+@@ -207,7 +207,13 @@ export function openExternalLink(href: string): void {
   * the modifier every app uses for "open this somewhere else". Middle-click
   * counts too: it is the other half of the same convention.
   */
 -export function wantsNativeBrowser(event: Pick<MouseEvent, 'button' | 'ctrlKey' | 'metaKey'>): boolean {
++// GROK BUILD PATCH (patches/0001-links-open-in-system-browser.patch). Upstream
++// sends a bare click to the in-app pane and puts the system browser behind
++// ⌘/Ctrl. We swap the two: a bare click goes where the user's logins,
++// extensions and tabs already are; the pane is kept, demoted to the modifier.
++// True when a click asked for the IN-APP browser — ⌘ on macOS, Ctrl elsewhere,
++// or middle-click, the "open this somewhere else" convention.
 +export function wantsInAppBrowser(event: Pick<MouseEvent, 'button' | 'ctrlKey' | 'metaKey'>): boolean {
    return event.button === 1 || (IS_MAC ? event.metaKey : event.ctrlKey)
  }
  
- /**
-  * Where a link the user clicked should open.
-  *
-- * A web page opens in the in-app browser — that pane exists so reading a doc
-- * doesn't cost a context switch out of Hermes, and it is the surface the agent
-- * can see. ⌘/Ctrl-click (or middle-click) escapes to the real browser, which is
-- * where you go for anything needing your logged-in session or a password.
-+ * A web page opens in the SYSTEM browser — that is where the user's logins,
-+ * extensions and tabs live, and a page that wants a password has no business in
-+ * an embedded webview. Pass `inApp` (⌘/Ctrl-click, or middle-click) to read it
-+ * in the preview pane instead, without a context switch out of the app.
-  *
-  * Everything that ISN'T a web page — `mailto:`, `file:`, a custom scheme — has
-  * no business in the webview and always hands off to the OS.
+@@ -236,14 +242,16 @@ export function hudForcesNativeLinks(search = typeof window === 'undefined' ? ''
+  * no business in the webview and always hands off to the OS. The HUD has no
+  * browser pane, so it always takes the OS path.
   */
 -export function openLink(href: string, options: { native?: boolean } = {}): void {
 +export function openLink(href: string, options: { inApp?: boolean } = {}): void {
@@ -159,12 +142,14 @@ index 0af32238e..1cc03bebf 100644
      return
    }
  
--  if (options.native || !/^https?:$/i.test(parseUrl(target)?.protocol ?? '')) {
-+  if (!options.inApp || !/^https?:$/i.test(parseUrl(target)?.protocol ?? '')) {
+-  if (options.native || hudForcesNativeLinks() || !/^https?:$/i.test(parseUrl(target)?.protocol ?? '')) {
++  // System browser unless the caller explicitly asked for the pane (`inApp`).
++  // HUD surfaces and non-web schemes always hand off to the OS, as upstream.
++  if (!options.inApp || hudForcesNativeLinks() || !/^https?:$/i.test(parseUrl(target)?.protocol ?? '')) {
      openExternalLink(target)
  
      return
-@@ -300,7 +307,7 @@ export function ExternalLink({
+@@ -314,7 +322,7 @@ export function ExternalLink({
  
          event.preventDefault()
          event.stopPropagation()
@@ -173,7 +158,7 @@ index 0af32238e..1cc03bebf 100644
        }}
        onClick={event => {
          event.stopPropagation()
-@@ -311,7 +318,7 @@ export function ExternalLink({
+@@ -325,7 +333,7 @@ export function ExternalLink({
          }
  
          event.preventDefault()

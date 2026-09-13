@@ -17,11 +17,16 @@
  *    local turn runs across the whole gateway; callers wait for the slot, and we
  *    look at Frozen's own queue so the user sees "waiting for Bionic" instead of
  *    a silent hang.
- *  - Never trigger a model load. The Hermes profile runs lmstudio_load_mode=jit
- *    (Hermes' own test proves jit skips the /api/v1/models/load preload), and a
- *    turn is refused unless its model is ALREADY loaded — LM Studio lists every
- *    DOWNLOADED model on /v1/models and would JIT-load any of them, evicting
- *    whatever Bionic has loaded.
+ *  - Never load over someone else's model. Loading is allowed ONLY when Frozen
+ *    has no chat model loaded at all (Michael's call, 2026-09-13: LM Studio Bionic
+ *    idle-unloads after an hour, and restarts come back empty). The decision is
+ *    re-made from a fresh probe while holding the Frozen slot, the load goes
+ *    through `lms load` with the context the model last ran with and a 1-hour
+ *    TTL, and success is confirmed on LM Studio's own list before anything is
+ *    sent. If ANY other model is loaded, the turn is refused — never swapped.
+ *    The Hermes profile runs lmstudio_load_mode=jit so Hermes itself never
+ *    preloads, and turns only name a model that is already loaded (LM Studio
+ *    would JIT-load any DOWNLOADED model a request names, evicting Bionic's).
  *  - Only ever stop the tunnel THIS process started. Never kill another app's ssh.
  *  - Never fall back to the cloud. A local failure is a clear local error.
  *  - Grok Build's [permission] deny list is mirrored into the profile by the
@@ -90,6 +95,84 @@ export function loadedModelsFrom(payload) {
       // true / false from LM Studio's capabilities; null when it doesn't say.
       toolUse: Array.isArray(m.capabilities) ? m.capabilities.includes("tool_use") : null,
     }));
+}
+
+/** Every chat model LM Studio lists — downloaded, loaded or not — from /api/v0/models. */
+export function downloadedModelsFrom(payload) {
+  return ((payload && payload.data) || [])
+    .filter((m) => m && (m.type === "llm" || m.type === "vlm"))
+    .map((m) => ({
+      id: m.id,
+      maxContextLength: m.max_context_length || null,
+      type: m.type,
+      toolUse: Array.isArray(m.capabilities) ? m.capabilities.includes("tool_use") : null,
+      loaded: m.state === "loaded",
+    }));
+}
+
+/**
+ * What may a chat do with Frozen as it is right now? Pure.
+ *   use            the chat's model is loaded
+ *   load           NOTHING is loaded and the model is downloaded — loading it evicts nothing
+ *   other-loaded   a different model is loaded (likely Bionic's) — never swap it out
+ *   not-downloaded nothing to load
+ */
+export function planModel(target, { loaded, downloaded }) {
+  const hit = (loaded || []).find((m) => m.id === target);
+  if (hit) return { action: "use", model: hit };
+  if ((loaded || []).length) return { action: "other-loaded", loaded };
+  const d = (downloaded || []).find((m) => m.id === target);
+  if (!d) return { action: "not-downloaded" };
+  return { action: "load", model: d };
+}
+
+/** The user-facing refusal for a plan, or null when the plan can proceed. Pure. */
+export function planRefusal(plan, target) {
+  if (!plan) return null;
+  if (plan.action === "other-loaded") {
+    const names = plan.loaded.map((m) => m.id).join(", ");
+    return (
+      `\`${target}\` isn't loaded on Frozen — it has ${names} loaded right now (probably Bionic's). ` +
+      `Grok Build won't swap out a model that's already loaded. Pick ${names} from the model menu, ` +
+      `or unload it in LM Studio on Frozen and try again.`
+    );
+  }
+  if (plan.action === "not-downloaded") {
+    return `\`${target}\` isn't downloaded on Frozen, so there's nothing to load. Pick another model from the model menu.`;
+  }
+  return null;
+}
+
+/**
+ * Context to load a model with: what it last ran with (remembered), else a
+ * Hermes-safe default, never above the model's own maximum. Pure.
+ */
+export function chooseLoadContext(model, remembered, { override = null, fallback = 65536 } = {}) {
+  const want = Number(override) > 0 ? Number(override) : (remembered && remembered.contextLength) || fallback;
+  const max = model && model.maxContextLength;
+  return Math.floor(max ? Math.min(want, max) : want);
+}
+
+/**
+ * A model id is placed inside a remote shell command (`lms load "<id>"`), so
+ * only allow the characters LM Studio ids actually use. Pure.
+ */
+export function isSafeModelId(id) {
+  return typeof id === "string" && /^[A-Za-z0-9][A-Za-z0-9._\-/@:]{0,199}$/.test(id);
+}
+
+/**
+ * The exact remote command that loads a model on Frozen. One builder so the
+ * string tests exercise is the string production runs. Flags verified against
+ * Frozen's installed CLI (`lms load --help`, 2026-09-13). Pure; throws on an
+ * unsafe id or non-positive numbers.
+ */
+export function lmsLoadCommand(id, contextLength, ttlSeconds, { estimateOnly = false } = {}) {
+  if (!isSafeModelId(id)) throw new Error(`unsafe model id: ${id}`);
+  const ctx = Math.floor(Number(contextLength));
+  const ttl = Math.floor(Number(ttlSeconds));
+  if (!(ctx > 0) || !(ttl > 0)) throw new Error(`invalid load numbers ctx=${contextLength} ttl=${ttlSeconds}`);
+  return `lms load "${id}" --context-length ${ctx} --ttl ${ttl} --identifier "${id}"${estimateOnly ? " --estimate-only" : ""} -y`;
 }
 
 /**
@@ -243,6 +326,13 @@ export function createFrozenLocal({ log, dataDir, repoDir, defaultCwd }) {
     // The deny-mirror plugin still hard-blocks protected paths before any approval.
     approvals: String(env.FROZEN_LOCAL_APPROVALS || "allow").toLowerCase() === "deny" ? "deny" : "allow",
     busyMaxWaitMs: Number(env.FROZEN_BUSY_MAX_WAIT_MS || 10 * 60 * 1000),
+    // When NOTHING is loaded on Frozen, a turn loads its chat's model. The TTL
+    // mirrors LM Studio Bionic's own idle unload (jitModelTTL 3600s), so a
+    // model Grok Build loads frees the GPU for Bionic after an hour idle too.
+    loadTtlSeconds: Number(env.FROZEN_LOAD_TTL_SECONDS || 3600),
+    loadContext: env.FROZEN_LOAD_CONTEXT ? Number(env.FROZEN_LOAD_CONTEXT) : null,
+    loadTimeoutMs: Number(env.FROZEN_LOAD_TIMEOUT_MS || 5 * 60 * 1000),
+    modelsFile: path.join(dataDir, "frozen-models.json"), // context each model last ran with
   };
   const baseUrl = `http://127.0.0.1:${cfg.localPort}/v1`;
 
@@ -250,6 +340,25 @@ export function createFrozenLocal({ log, dataDir, repoDir, defaultCwd }) {
     const sys = path.join(env.SystemRoot || "C:\\Windows", "System32", "OpenSSH", "ssh.exe");
     return process.platform === "win32" && fs.existsSync(sys) ? sys : "ssh";
   };
+  // Test seam: FROZEN_SSH_CMD='["<node.exe>","<fake-ssh.mjs>"]' replaces the ssh
+  // transport for remote commands (a .cmd stub can't be spawned without a shell
+  // on Windows). The same argv is appended either way. Unset in production.
+  const sshCmd = () => {
+    if (env.FROZEN_SSH_CMD) {
+      try {
+        const a = JSON.parse(env.FROZEN_SSH_CMD);
+        if (Array.isArray(a) && a.length) return a.map(String);
+      } catch { /* fall through to real ssh */ }
+    }
+    return [sshBin()];
+  };
+  const clean = (s) => String(s || "").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").replace(/\r/g, "");
+  const lastLine = (s) =>
+    clean(s)
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l && !/post-quantum|store now|openssh\.com\/pq|may need to be upgraded/i.test(l))
+      .pop() || "";
   const sshBase = () => [
     "-i", cfg.sshKey,
     "-o", "IdentitiesOnly=yes",
@@ -260,7 +369,8 @@ export function createFrozenLocal({ log, dataDir, repoDir, defaultCwd }) {
   ];
   const sshRun = (command, timeoutMs) =>
     new Promise((resolve) => {
-      execFile(sshBin(), [...sshBase(), cfg.sshTarget, command], { windowsHide: true, timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 },
+      const [bin, ...pre] = sshCmd();
+      execFile(bin, [...pre, ...sshBase(), cfg.sshTarget, command], { windowsHide: true, timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 },
         (error, stdout, stderr) => resolve({ code: error ? error.code ?? 1 : 0, stdout: String(stdout || ""), stderr: String(stderr || "") }));
     });
 
@@ -280,6 +390,30 @@ export function createFrozenLocal({ log, dataDir, repoDir, defaultCwd }) {
   let routePromise = null;
   let lastServerStart = 0;
   let lastLoaded = [];
+  let lastDownloaded = [];
+
+  function readRemembered() {
+    try {
+      const v = JSON.parse(fs.readFileSync(cfg.modelsFile, "utf8"));
+      return v && typeof v === "object" ? v : {};
+    } catch {
+      return {};
+    }
+  }
+  /** Remember the context each loaded model runs with, so a reload matches it. */
+  function rememberLoaded(loaded) {
+    if (!loaded.length) return;
+    const cur = readRemembered();
+    let changed = false;
+    for (const m of loaded) {
+      if (!m.contextLength || (cur[m.id] && cur[m.id].contextLength === m.contextLength)) continue;
+      cur[m.id] = { contextLength: m.contextLength, seenAt: new Date().toISOString() };
+      changed = true;
+    }
+    if (changed) {
+      try { fs.writeFileSync(cfg.modelsFile, JSON.stringify(cur, null, 2)); } catch { /* best effort */ }
+    }
+  }
 
   async function probeLoaded() {
     let res;
@@ -289,9 +423,40 @@ export function createFrozenLocal({ log, dataDir, repoDir, defaultCwd }) {
       throw fail("UNREACHABLE", e.cause?.code || e.message);
     }
     if (!res.ok) throw fail("HTTP", `LM Studio answered HTTP ${res.status}`);
-    const loaded = loadedModelsFrom(await res.json());
+    const payload = await res.json();
+    const loaded = loadedModelsFrom(payload);
     lastLoaded = loaded;
+    lastDownloaded = downloadedModelsFrom(payload);
+    rememberLoaded(loaded);
     return loaded;
+  }
+
+  /**
+   * Load a model on Frozen through the `lms` CLI (the REST load endpoint has no
+   * TTL, which would pin the model forever). Called ONLY when a fresh probe,
+   * taken while holding the Frozen slot, shows nothing loaded. Success is judged
+   * by LM Studio's own model list, not the CLI's exit code.
+   */
+  async function loadModel(model, contextLength) {
+    if (!isSafeModelId(model.id)) throw fail("BAD_ID", `refusing to pass an unusual model id to Frozen's shell: ${model.id}`);
+    const cmd = lmsLoadCommand(model.id, contextLength, cfg.loadTtlSeconds);
+    log(`frozen: loading ${model.id} ctx=${contextLength} ttl=${cfg.loadTtlSeconds}s (nothing was loaded on Frozen)`);
+    const t0 = Date.now();
+    const r = await sshRun(cmd, cfg.loadTimeoutMs);
+    for (let i = 0; i < 20; i++) {
+      let loaded = null;
+      try { loaded = await probeLoaded(); } catch { /* retry */ }
+      const hit = loaded && loaded.find((m) => m.id === model.id);
+      if (hit) {
+        log(`frozen: loaded ${model.id} ctx=${hit.contextLength} in ${((Date.now() - t0) / 1000).toFixed(1)}s (lms exit ${r.code})`);
+        return hit;
+      }
+      if (r.code !== 0 && i >= 1) break; // the CLI said it failed and LM Studio agrees
+      await sleep(1500);
+    }
+    const why = lastLine(r.stderr) || lastLine(r.stdout) || `lms exited with code ${r.code}`;
+    log(`frozen: load of ${model.id} failed: ${why}`);
+    throw fail("LOAD", why);
   }
 
   const tunnelAlive = () => !!(tunnel && tunnel.proc.exitCode === null);
@@ -352,7 +517,7 @@ export function createFrozenLocal({ log, dataDir, repoDir, defaultCwd }) {
       await sleep(1000);
     }
     if (portWasOpen && !tunnelAlive()) {
-      throw fail("PORT_BUSY", `Port ${cfg.localPort} is held by another program that isn't forwarding to Frozen's LM Studio. mjhub won't stop another app's process — free the port or set FROZEN_LOCAL_PORT.`);
+      throw fail("PORT_BUSY", `Port ${cfg.localPort} is held by another program that isn't forwarding to Frozen's LM Studio. Grok Build won't stop another app's process — free the port or set FROZEN_LOCAL_PORT.`);
     }
     throw fail("ROUTE", `Frozen's LM Studio API isn't answering through the tunnel. Is the Frozen PC on and LM Studio running?`);
   }
@@ -518,7 +683,18 @@ export function createFrozenLocal({ log, dataDir, repoDir, defaultCwd }) {
     async inventory(budgetMs = 4000) {
       try {
         const loaded = await Promise.race([ensureRoute(), sleep(budgetMs).then(() => { throw fail("TIMEOUT", "Frozen didn't answer in time"); })]);
-        if (!loaded.length) return { ok: true, models: loaded, warning: "Frozen has no chat model loaded right now." };
+        if (!loaded.length) {
+          // Nothing loaded: offer the downloaded models this gateway has run
+          // before; the first message loads the one picked (evicts nothing).
+          const mem = readRemembered();
+          const offer = lastDownloaded
+            .filter((m) => mem[m.id])
+            .map((m) => ({ id: m.id, contextLength: mem[m.id].contextLength, maxContextLength: m.maxContextLength, type: m.type, toolUse: m.toolUse }));
+          const warning = offer.length
+            ? `Nothing is loaded on Frozen right now (LM Studio unloads idle models after an hour). Grok Build loads ${offer.length === 1 ? offer[0].id : "the model you pick"} on your first message — about a minute.`
+            : "Nothing is loaded on Frozen right now, and Grok Build hasn't run a model there yet — load one in LM Studio on Frozen once.";
+          return { ok: true, models: offer, warning };
+        }
         const notes = [];
         for (const m of loaded) {
           const a = assessModel(m);
@@ -536,9 +712,39 @@ export function createFrozenLocal({ log, dataDir, repoDir, defaultCwd }) {
     },
 
     /**
+     * Can a chat select `model` right now? Same rules a turn applies. Resolves
+     * { ok:true, willLoad } or { ok:false, code, reason }.
+     */
+    async checkSelectable(model, budgetMs = 6000) {
+      let loaded;
+      try {
+        loaded = await Promise.race([ensureRoute(), sleep(budgetMs).then(() => { throw fail("TIMEOUT", "Frozen didn't answer in time"); })]);
+      } catch (e) {
+        return { ok: false, code: 4041, reason: `Frozen unavailable: ${e.message}` };
+      }
+      const plan = planModel(model, { loaded, downloaded: lastDownloaded });
+      const refusal = planRefusal(plan, model);
+      if (refusal) return { ok: false, code: 4041, reason: refusal };
+      if (plan.action === "load" && !isSafeModelId(model)) {
+        return { ok: false, code: 4041, reason: `${model} has an unusual name, so Grok Build won't load it on Frozen.` };
+      }
+      const probe = plan.action === "use"
+        ? plan.model
+        : { ...plan.model, contextLength: chooseLoadContext(plan.model, readRemembered()[model], { override: cfg.loadContext }) };
+      const verdict = assessModel(probe);
+      if (verdict.refuse) return { ok: false, code: 4042, reason: verdict.refuse };
+      return { ok: true, willLoad: plan.action === "load" };
+    },
+
+    /**
      * Run one visible turn. `hooks` = { onEvent(type,payload), onText(t), onReasoning(t),
      * onStatus(text), isCancelled() }. Resolves { status, note?, usage }.
      */
+    /** Record a model's context (used to seed a known-good value). */
+    remember(id, contextLength) {
+      rememberLoaded([{ id, contextLength }]);
+    },
+
     async runTurn(session, text, hooks) {
       const label = `${session.id.slice(0, 8)}-${Date.now()}`;
       const state = { tools: new Map(), seq: 0, contextUsed: null, contextSize: null };
@@ -551,16 +757,9 @@ export function createFrozenLocal({ log, dataDir, repoDir, defaultCwd }) {
       } catch (e) {
         return { status: "error", note: `⚠️ Frozen Local is unavailable: ${e.message} (No cloud fallback — pick Grok from the model menu to use your subscription instead.)` };
       }
-      if (!loaded.length) {
-        return { status: "error", note: "⚠️ Frozen has no chat model loaded right now, so there's nothing to run. mjhub won't load one itself (Frozen is shared with Bionic) — load a model in LM Studio on Frozen, then try again." };
-      }
-      const loadedModel = loaded.find((m) => m.id === session.model);
-      if (!loadedModel) {
-        const names = loaded.map((m) => m.id).join(", ");
-        return { status: "error", note: `⚠️ This chat is set to \`${session.model}\`, but Frozen currently has only ${names} loaded. mjhub won't load a different model on Frozen (it's shared with Bionic). Pick the loaded model from the model menu.` };
-      }
-      const assessment = assessModel(loadedModel);
-      if (assessment.refuse) return { status: "error", note: `⚠️ ${assessment.refuse}` };
+      // Cheap early refusal (no slot needed) when Frozen clearly can't serve this chat.
+      const early = planRefusal(planModel(session.model, { loaded, downloaded: lastDownloaded }), session.model);
+      if (early) return { status: "error", note: `⚠️ ${early}` };
 
       // 2) one request at a time across the whole gateway
       const slot = acquireSlot(label);
@@ -568,6 +767,38 @@ export function createFrozenLocal({ log, dataDir, repoDir, defaultCwd }) {
       const release = await slot.acquired;
       try {
         if (hooks.isCancelled()) return { status: "interrupted" };
+
+        // 2b) re-check UNDER the slot — Bionic may have loaded or unloaded something
+        // while we waited. Loading is only ever decided from this fresh look.
+        let fresh;
+        try {
+          fresh = await probeLoaded();
+        } catch (e) {
+          return { status: "error", note: `⚠️ Frozen Local is unavailable: ${e.message}` };
+        }
+        const plan = planModel(session.model, { loaded: fresh, downloaded: lastDownloaded });
+        const refusal = planRefusal(plan, session.model);
+        if (refusal) return { status: "error", note: `⚠️ ${refusal}` };
+
+        let loadedModel = plan.model;
+        if (plan.action === "load") {
+          const ctx = chooseLoadContext(plan.model, readRemembered()[plan.model.id], { override: cfg.loadContext });
+          const pre = assessModel({ ...plan.model, contextLength: ctx });
+          if (pre.refuse) return { status: "error", note: `⚠️ ${pre.refuse}` };
+          hooks.onStatus(
+            `Loading \`${plan.model.id}\` on Frozen with ${ctx.toLocaleString("en-US")} context — nothing was loaded ` +
+              `(LM Studio unloads idle models after an hour). This takes about a minute.\n`
+          );
+          try {
+            loadedModel = await loadModel(plan.model, ctx);
+          } catch (e) {
+            return { status: "error", note: `⚠️ Couldn't load \`${plan.model.id}\` on Frozen: ${e.message}. Nothing was sent to the model.` };
+          }
+          busyCache.at = 0;
+          if (hooks.isCancelled()) return { status: "interrupted" };
+        }
+        const assessment = assessModel(loadedModel);
+        if (assessment.refuse) return { status: "error", note: `⚠️ ${assessment.refuse}` };
 
         // 3) respect Bionic: wait while Frozen's own queue is busy
         const t0 = Date.now();

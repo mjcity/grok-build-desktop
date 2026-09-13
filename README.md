@@ -329,9 +329,14 @@ server if needed, and never stops it.
 
 Frozen is shared with Bionic, so the rules are strict:
 
-- **Never loads a model.** Only already-loaded models are offered, anything else
-  is refused, and the Hermes profile runs `lmstudio_load_mode: jit` (explicit
-  mode would POST `/api/v1/models/load`).
+- **Loads only into an empty Frozen.** LM Studio Bionic unloads a model after an
+  hour idle, and restarts come back with nothing loaded. When Frozen has *no* chat
+  model loaded, a local turn loads its chat's model (`lms load … --ttl 3600`, at
+  the context it last ran with, remembered in `frozen-models.json`), shows
+  "Loading … on Frozen", and confirms the load on LM Studio before sending
+  anything. If *any other* model is loaded — probably Bionic's — it refuses and
+  never swaps it out; that decision is re-checked while holding the Frozen slot.
+  The Hermes profile runs `lmstudio_load_mode: jit`, so Hermes never preloads.
 - **One request at a time**, gateway-wide. If Frozen's own queue is busy, the chat
   shows "waiting for Frozen" instead of stacking requests on Bionic.
 - **Same deny list as Grok.** The `grok-deny-mirror` Hermes plugin
@@ -342,7 +347,9 @@ Frozen is shared with Bionic, so the rules are strict:
 The Hermes profile lives in `%USERPROFILE%\.grok-hermes-desktop\hermes-local` and
 is rebuilt from `hermes-profile/` on the first local turn. Settings (all optional):
 `FROZEN_SSH_TARGET`, `FROZEN_SSH_KEY`, `FROZEN_LOCAL_PORT`, `FROZEN_REMOTE_PORT`,
-`FROZEN_HERMES_EXE`, `FROZEN_BUSY_MAX_WAIT_MS`, and `FROZEN_LOCAL_APPROVALS`
+`FROZEN_HERMES_EXE`, `FROZEN_BUSY_MAX_WAIT_MS`, `FROZEN_LOAD_TTL_SECONDS` (3600),
+`FROZEN_LOAD_CONTEXT`, `FROZEN_LOAD_TIMEOUT_MS`, `FROZEN_ABSOLUTE_TIMEOUT_MS`
+(3 h — local turns are slow; Grok keeps its 45 min), and `FROZEN_LOCAL_APPROVALS`
 (`allow`, the default, matches Grok's `--always-approve`; `deny` auto-rejects
 Hermes' dangerous-command prompts).
 
@@ -359,6 +366,8 @@ node scripts\reflect-e2e.mjs   # self-improvement fires invisibly + unblocks
 node scripts\account-relogin-test.mjs   # re-login clears a spent account's marker
 node scripts\frozen-local-unit-test.mjs # Frozen Local pure logic (no network)
 node scripts\frozen-local-e2e.mjs       # Frozen Local live, on a throwaway gateway
+node scripts\frozen-local-swap-e2e.mjs  # a model swap never requests an unloaded model (mock)
+node scripts\frozen-local-load-e2e.mjs  # loads only into an empty Frozen, never over another (mock)
 <hermes venv>\python.exe scripts\deny-mirror-test.py hermes-profile\plugins\grok-deny-mirror
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\verify-cold-start.ps1
 ```

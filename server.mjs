@@ -35,7 +35,6 @@ import {
   LOCAL_SLUG,
   LOCAL_LABEL,
   parseModelSwitch,
-  assessModel,
 } from "./local-provider.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -362,6 +361,14 @@ const STALL_TIMEOUT_MS = Number(
 );
 const ABSOLUTE_TIMEOUT_MS = Number(
   process.env.GROK_ABSOLUTE_TIMEOUT_MS || 45 * 60 * 1000
+);
+// Frozen Local's backstop is separate and much longer. A 27B model on one GPU
+// doing a full blog task makes steady progress for well over 45 minutes — the
+// Grok limit killed three such turns mid-work on 2026-09-13 (tool calls every
+// ~10-30s right up to the kill). The 15-minute stall watchdog still catches a
+// truly hung turn; this only stops a pathological loop.
+const LOCAL_ABSOLUTE_TIMEOUT_MS = Number(
+  process.env.FROZEN_ABSOLUTE_TIMEOUT_MS || 3 * 60 * 60 * 1000
 );
 const WATCHDOG_INTERVAL_MS = 15_000;
 
@@ -2015,7 +2022,7 @@ function runLocalTurn(session, text) {
   const watchdogTimer = setInterval(() => {
     const now = Date.now();
     const last = turnActivityAt.get(sid) || turnStartedAt;
-    if (now - turnStartedAt > ABSOLUTE_TIMEOUT_MS) autoKillReason = "absolute";
+    if (now - turnStartedAt > LOCAL_ABSOLUTE_TIMEOUT_MS) autoKillReason = "absolute";
     else if (now - last > STALL_TIMEOUT_MS) autoKillReason = "stall";
     else return;
     log(`turn ${autoKillReason} session=${sid.slice(0, 8)} provider=${LOCAL_SLUG} elapsed=${now - turnStartedAt}ms sinceActivity=${now - last}ms`);
@@ -2066,7 +2073,7 @@ function runLocalTurn(session, text) {
       note =
         autoKillReason === "stall"
           ? `⚠️ Frozen Local stopped responding — no activity for ${formatDuration(STALL_TIMEOUT_MS)}, so this turn was cancelled automatically. Completed tool steps above are not re-run.`
-          : `⚠️ This turn ran past the ${formatDuration(ABSOLUTE_TIMEOUT_MS)} safety limit and was stopped. Everything up to this point is saved — send a follow-up to continue.`;
+          : `⚠️ This turn ran past the ${formatDuration(LOCAL_ABSOLUTE_TIMEOUT_MS)} safety limit and was stopped. Everything up to this point is saved — send a follow-up to continue.`;
     } else if (cancelled && status !== "error") {
       status = "interrupted";
     }
@@ -3148,22 +3155,12 @@ wss.on("connection", (ws) => {
             emit(target.id, "session.info", sessionInfoPayload(target, false));
           };
           if (provider === LOCAL_SLUG) {
-            // Refuse anything not ALREADY loaded on Frozen: LM Studio would
-            // JIT-load it and evict whatever Bionic is using.
-            frozen.inventory(6000).then((inv) => {
-              const lm = inv.models.find((m) => m.id === sw.model);
-              if (!lm) {
-                const loaded = inv.models.map((m) => m.id).join(", ") || "none";
-                return err(
-                  4041,
-                  inv.ok
-                    ? `${sw.model} isn't loaded on Frozen (loaded: ${loaded}). mjhub won't load models on Frozen — it's shared with Bionic.`
-                    : inv.warning
-                );
-              }
-              // Loaded, but with too little context for the agent to run at all.
-              const verdict = assessModel(lm);
-              if (verdict.refuse) return err(4042, verdict.refuse);
+            // Same rules a turn applies: the loaded model is fine; with NOTHING
+            // loaded a downloaded model is fine (the first message loads it and
+            // evicts nothing); anything else loaded means refuse — never swap
+            // out Bionic's model.
+            frozen.checkSelectable(sw.model).then((v) => {
+              if (!v.ok) return err(v.code, v.reason);
               settleSwitch();
             });
             return;

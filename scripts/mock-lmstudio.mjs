@@ -11,9 +11,52 @@
 import http from "node:http";
 
 export function startMockLmStudio({ loaded = [], downloaded = [] } = {}) {
-  const state = { loaded: [...loaded], downloaded: [...downloaded] };
+  const state = {
+    loaded: [...loaded],
+    downloaded: [...downloaded],
+    failLoad: false,
+    completionDelayMs: 0,
+    flip: null, // { remaining, loaded } — swap the loaded set after N more /api/v0/models probes
+  };
   const completions = [];
   const unknown = [];
+  const loads = []; // every `lms load` the gateway ran: { at, key, contextLength, ttl, identifier, ok }
+  let probes = 0;
+
+  /** Emulate the subset of the `lms` CLI the gateway uses. */
+  const tokenize = (s) => [...String(s).matchAll(/"([^"]*)"|(\S+)/g)].map((m) => (m[1] !== undefined ? m[1] : m[2]));
+  function runLms(command) {
+    const t = tokenize(command);
+    if (t[0] !== "lms") return { code: 127, stdout: "", stderr: `mock: not an lms command: ${command}` };
+    if (t[1] === "ps" && t.includes("--json")) {
+      const rows = state.loaded.map((m) => ({
+        type: "llm", modelKey: m.id, identifier: m.identifier || m.id, contextLength: m.ctx || 32768,
+        status: "idle", queued: 0, parallel: 1, ttlMs: m.ttl ? m.ttl * 1000 : null,
+      }));
+      return { code: 0, stdout: JSON.stringify(rows), stderr: "" };
+    }
+    if (t[1] === "server" && t[2] === "start") return { code: 0, stdout: "Success! Server is now running on port 1234", stderr: "" };
+    if (t[1] === "load") {
+      const key = t[2];
+      const opt = (name) => { const i = t.indexOf(name); return i >= 0 ? t[i + 1] : undefined; };
+      const rec = {
+        at: Date.now(), key,
+        contextLength: Number(opt("--context-length")),
+        ttl: Number(opt("--ttl")),
+        identifier: opt("--identifier"),
+        yes: t.includes("-y"),
+        ok: false,
+      };
+      loads.push(rec);
+      const def = state.downloaded.find((d) => d.id === key);
+      if (state.failLoad) return { code: 1, stdout: "", stderr: "Error: mock load failure (not enough memory)" };
+      if (!def) return { code: 1, stdout: "", stderr: `Error: No model found that matches "${key}"` };
+      state.loaded = [...state.loaded, { ...def, id: rec.identifier || key, ctx: rec.contextLength || def.ctx, ttl: rec.ttl || null }];
+      rec.ok = true;
+      return { code: 0, stdout: `Model loaded successfully in 1.00s.\nTo use the model in the API/SDK, use the identifier "${rec.identifier || key}".`, stderr: "" };
+    }
+    return { code: 1, stdout: "", stderr: `mock: unsupported lms command: ${command}` };
+  }
 
   const entry = (m, isLoaded) => ({
     id: m.id,
@@ -44,7 +87,19 @@ export function startMockLmStudio({ loaded = [], downloaded = [] } = {}) {
         res.end(JSON.stringify(obj));
       };
 
-      if (req.method === "GET" && url === "/api/v0/models") return json(200, { object: "list", data: allModels() });
+      if (req.method === "POST" && url === "/__mock/lms") {
+        let cmd = "";
+        try { cmd = JSON.parse(body).command || ""; } catch { /* ignore */ }
+        return json(200, runLms(cmd));
+      }
+      if (req.method === "GET" && url === "/api/v0/models") {
+        probes++;
+        if (state.flip) {
+          if (state.flip.remaining <= 0) { state.loaded = [...state.flip.loaded]; state.flip = null; }
+          else state.flip.remaining--;
+        }
+        return json(200, { object: "list", data: allModels() });
+      }
       if (req.method === "GET" && url.startsWith("/api/v0/models/")) {
         const id = decodeURIComponent(url.slice("/api/v0/models/".length));
         const m = allModels().find((x) => x.id === id);
@@ -57,14 +112,28 @@ export function startMockLmStudio({ loaded = [], downloaded = [] } = {}) {
       if (req.method === "POST" && url === "/v1/chat/completions") {
         let parsed = {};
         try { parsed = JSON.parse(body); } catch { /* ignore */ }
+        // Record at ARRIVAL: which model was requested, and what was loaded at that instant.
         completions.push({
           at: Date.now(),
           model: parsed.model,
           loadedAtRequest: state.loaded.map((m) => m.id),
           messages: parsed.messages || [],
         });
+        const reply = () => answerCompletion(parsed, res, json, completions.length);
+        if (state.completionDelayMs > 0) return void setTimeout(reply, state.completionDelayMs); // simulate a slow model
+        return reply();
+      }
+
+      unknown.push(`${req.method} ${url}`);
+      return json(404, { error: `mock-lmstudio: unhandled ${req.method} ${url}` });
+    });
+  });
+
+  function answerCompletion(parsed, res, json, n) {
+    if (res.destroyed || res.writableEnded) return; // client gave up (e.g. a cancelled turn)
+    {
         const text = `MOCK-REPLY from ${parsed.model}`;
-        const id = `chatcmpl-mock-${completions.length}`;
+        const id = `chatcmpl-mock-${n}`;
         const created = Math.floor(Date.now() / 1000);
         const usage = { prompt_tokens: 100, completion_tokens: 5, total_tokens: 105 };
         if (parsed.stream) {
@@ -85,12 +154,8 @@ export function startMockLmStudio({ loaded = [], downloaded = [] } = {}) {
           choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
           usage,
         });
-      }
-
-      unknown.push(`${req.method} ${url}`);
-      return json(404, { error: `mock-lmstudio: unhandled ${req.method} ${url}` });
-    });
-  });
+    }
+  }
 
   return new Promise((resolve) => {
     server.listen(0, "127.0.0.1", () => {
@@ -98,8 +163,15 @@ export function startMockLmStudio({ loaded = [], downloaded = [] } = {}) {
         port: server.address().port,
         completions,
         unknown,
+        loads,
+        get probes() { return probes; },
+        loadedIds: () => state.loaded.map((m) => m.id),
         setLoaded: (models) => { state.loaded = [...models]; },
-        close: () => new Promise((r) => server.close(r)),
+        setFailLoad: (v) => { state.failLoad = !!v; },
+        setCompletionDelay: (ms) => { state.completionDelayMs = ms; },
+        /** The next `n` /api/v0/models probes see today's state; every later one sees `models` loaded. */
+        flipAfterProbes: (n, models) => { state.flip = { remaining: n, loaded: [...models] }; },
+        close: () => new Promise((r) => { server.closeAllConnections?.(); server.close(r); }),
       });
     });
   });

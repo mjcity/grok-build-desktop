@@ -11,6 +11,12 @@ import {
   modelFromChoice,
   assessModel,
   HERMES_CONTEXT_FLOOR,
+  downloadedModelsFrom,
+  planModel,
+  planRefusal,
+  chooseLoadContext,
+  isSafeModelId,
+  lmsLoadCommand,
   LOCAL_SLUG,
 } from "../local-provider.mjs";
 
@@ -125,6 +131,34 @@ const notool = assessModel({ id: "nt", contextLength: 143360, toolUse: false });
 ok("not tool-capable -> warning, not refusal", notool.refuse === null && /tool-capable/.test(notool.warn.join(" ")));
 ok("unknown capability (null) is not flagged", assessModel({ id: "u", contextLength: 143360, toolUse: null }).warn.length === 0);
 ok("unknown context (null) is not refused", assessModel({ id: "u", contextLength: null, toolUse: true }).refuse === null);
+
+/* ── load-when-nothing-is-loaded policy (2026-09-13) ── */
+const dl = downloadedModelsFrom(fixture);
+ok("downloaded list includes loaded AND not-loaded chat models, no embeddings", dl.length === 13 && dl.some((m) => m.id === "google/gemma-4-31b" && !m.loaded) && !dl.some((m) => m.type === "embeddings"));
+const HUI = "huihui-qwen3.8-27b-abliterated";
+const Lh = [{ id: HUI, contextLength: 143360 }];
+const Dl = [{ id: HUI, maxContextLength: 262144 }, { id: "google/gemma-4-31b", maxContextLength: 131072 }];
+ok("plan: chat's model loaded -> use", planModel(HUI, { loaded: Lh, downloaded: Dl }).action === "use");
+ok("plan: NOTHING loaded + downloaded -> load", planModel(HUI, { loaded: [], downloaded: Dl }).action === "load");
+ok("plan: another model loaded -> other-loaded (never load on top)", planModel("google/gemma-4-31b", { loaded: Lh, downloaded: Dl }).action === "other-loaded");
+ok("plan: nothing loaded, not downloaded -> not-downloaded", planModel("nope/x", { loaded: [], downloaded: Dl }).action === "not-downloaded");
+// MUTATION: a plan that ignores what's loaded would load on top of Bionic's model.
+const naivePlan = (t, { downloaded }) => (downloaded.find((m) => m.id === t) ? { action: "load" } : { action: "not-downloaded" });
+ok("MUTATION: ignoring the loaded list would load over Bionic's model (the rule has teeth)",
+  naivePlan("google/gemma-4-31b", { loaded: Lh, downloaded: Dl }).action === "load" && planModel("google/gemma-4-31b", { loaded: Lh, downloaded: Dl }).action !== "load");
+const refOther = planRefusal(planModel("google/gemma-4-31b", { loaded: Lh, downloaded: Dl }), "google/gemma-4-31b");
+ok("refusal text: other-loaded names the loaded model and says it won't swap", /isn't loaded/.test(refOther) && refOther.includes(HUI) && /won't swap/.test(refOther));
+ok("refusal text never says 'mjhub' (wrong app)", !/mjhub/i.test(refOther + planRefusal({ action: "not-downloaded" }, "x")));
+ok("refusal: use/load -> null", planRefusal({ action: "use" }, "x") === null && planRefusal({ action: "load" }, "x") === null);
+ok("load context: remembered value wins", chooseLoadContext({ maxContextLength: 262144 }, { contextLength: 143360 }) === 143360);
+ok("load context: never above the model's max", chooseLoadContext({ maxContextLength: 32768 }, { contextLength: 143360 }) === 32768);
+ok("load context: unknown model -> 64K-class default (>= Hermes floor)", chooseLoadContext({ maxContextLength: 262144 }, undefined) >= HERMES_CONTEXT_FLOOR);
+ok("load context: FROZEN_LOAD_CONTEXT override wins, still capped", chooseLoadContext({ maxContextLength: 100000 }, { contextLength: 143360 }, { override: 200000 }) === 100000);
+ok("safe ids: real LM Studio ids pass", ["huihui-qwen3.8-27b-abliterated", "google/gemma-4-31b", "qwen3:8b@q4_k_m", "unsloth/qwen3.8-27b"].every(isSafeModelId));
+ok("load command: exact production string", lmsLoadCommand(HUI, 143360, 3600) === `lms load "${HUI}" --context-length 143360 --ttl 3600 --identifier "${HUI}" -y`);
+ok("load command: estimate-only variant only adds the flag", lmsLoadCommand(HUI, 143360, 3600, { estimateOnly: true }) === `lms load "${HUI}" --context-length 143360 --ttl 3600 --identifier "${HUI}" --estimate-only -y`);
+ok("load command: refuses an unsafe id and bad numbers", [() => lmsLoadCommand('x" & calc', 1, 1), () => lmsLoadCommand(HUI, 0, 3600), () => lmsLoadCommand(HUI, 143360, NaN)].every((f) => { try { f(); return false; } catch { return true; } }));
+ok("safe ids: shell metacharacters are rejected", ['a" && calc', "a;b", "a|b", "a&b", "a`b`", "$(x)", "a b", "a\nb", "", "-rf"].every((s) => !isSafeModelId(s)));
 
 console.log(`\n  RESULT: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

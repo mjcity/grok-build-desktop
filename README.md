@@ -314,6 +314,38 @@ to answer with its 402, and paying that on every message after an idle gap
 reads as the app having hung.
 (`GROK_ACCOUNT_RESET_WINDOW_MS` still works as an alias.)
 
+### 🧊 Frozen Local — a local model as a per-chat option
+
+Pick **Frozen Local** in a chat's model menu to run that chat on the LM Studio
+model loaded on the Frozen-RGB PC instead of Grok. It's per chat: Grok stays the
+default everywhere else, and its CLI path and account fallback are untouched.
+
+It is a real agent, not a chat box. The gateway drives the installed **Hermes
+agent** (`hermes acp`, over ACP) with Hermes' own built-in LM Studio provider, so
+local chats get tool calls, streaming, tool chips, Stop, and resume across
+restarts. The model is reached over an SSH tunnel the gateway opens and owns
+(`127.0.0.1:12345 → Frozen 127.0.0.1:1234`); it starts Frozen's LM Studio API
+server if needed, and never stops it.
+
+Frozen is shared with Bionic, so the rules are strict:
+
+- **Never loads a model.** Only already-loaded models are offered, anything else
+  is refused, and the Hermes profile runs `lmstudio_load_mode: jit` (explicit
+  mode would POST `/api/v1/models/load`).
+- **One request at a time**, gateway-wide. If Frozen's own queue is busy, the chat
+  shows "waiting for Frozen" instead of stacking requests on Bionic.
+- **Same deny list as Grok.** The `grok-deny-mirror` Hermes plugin
+  (`hermes-profile/plugins/`) reads `[permission] deny` from `~/.grok/config.toml`
+  live and vetoes writes there, from file tools and terminal alike.
+- **No cloud fallback.** A local failure is a clear local error.
+
+The Hermes profile lives in `%USERPROFILE%\.grok-hermes-desktop\hermes-local` and
+is rebuilt from `hermes-profile/` on the first local turn. Settings (all optional):
+`FROZEN_SSH_TARGET`, `FROZEN_SSH_KEY`, `FROZEN_LOCAL_PORT`, `FROZEN_REMOTE_PORT`,
+`FROZEN_HERMES_EXE`, `FROZEN_BUSY_MAX_WAIT_MS`, and `FROZEN_LOCAL_APPROVALS`
+(`allow`, the default, matches Grok's `--always-approve`; `deny` auto-rejects
+Hermes' dangerous-command prompts).
+
 ## ✅ Verifying an install
 
 Every claim above has an exit-code-gated test — no "trust me":
@@ -324,6 +356,10 @@ node scripts\feed-e2e.mjs      # reasoning/text streaming timeline
 node scripts\tools-e2e.mjs     # tool chips live during a tool-using turn
 node scripts\stall-e2e.mjs     # recovers from a genuinely hung grok.exe
 node scripts\reflect-e2e.mjs   # self-improvement fires invisibly + unblocks
+node scripts\account-relogin-test.mjs   # re-login clears a spent account's marker
+node scripts\frozen-local-unit-test.mjs # Frozen Local pure logic (no network)
+node scripts\frozen-local-e2e.mjs       # Frozen Local live, on a throwaway gateway
+<hermes venv>\python.exe scripts\deny-mirror-test.py hermes-profile\plugins\grok-deny-mirror
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\verify-cold-start.ps1
 ```
 

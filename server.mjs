@@ -30,6 +30,12 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
+import {
+  createFrozenLocal,
+  LOCAL_SLUG,
+  LOCAL_LABEL,
+  parseModelSwitch,
+} from "./local-provider.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.GROK_GATEWAY_PORT || 8787);
@@ -49,6 +55,18 @@ const DEFAULT_CWD = resolveDefaultCwd();
 
 fs.mkdirSync(LOGS, { recursive: true });
 const STORE = path.join(DATA, "sessions.json");
+
+// Frozen Local: a per-chat alternative provider (the real Hermes agent against
+// the LM Studio model on Frozen-RGB). Grok stays the default and its CLI path,
+// including the two-account fallback, is untouched. See local-provider.mjs.
+// Nothing here connects to Frozen until a chat actually selects it.
+const frozen = createFrozenLocal({
+  log: (m) => log(m),
+  dataDir: DATA,
+  repoDir: __dirname,
+  defaultCwd: DEFAULT_CWD,
+});
+const isLocal = (s) => !!s && s.provider === LOCAL_SLUG;
 
 // ── logging ───────────────────────────────────────────────────────────────
 
@@ -512,6 +530,14 @@ function forceKillPidTree(pid) {
 
 process.on("beforeExit", () => flushStore());
 process.on("exit", () => {
+  // Stop only what the Frozen provider spawned (its hermes acp + ssh tunnel).
+  // Frozen's LM Studio server and loaded model are shared with Bionic and are
+  // never stopped from here.
+  try {
+    frozen.shutdown();
+  } catch {
+    /* best effort */
+  }
   if (storeDirty && storeCache) {
     try {
       fs.writeFileSync(STORE, JSON.stringify(storeCache, null, 2), "utf8");
@@ -547,6 +573,8 @@ function createSession(partial = {}) {
     title: partial.title || "",
     cwd: partial.cwd || DEFAULT_CWD,
     model: partial.model || MODEL,
+    // "grok-cli" (default) or "frozen-local". Chosen per chat; never global.
+    provider: partial.provider === LOCAL_SLUG ? LOCAL_SLUG : PROVIDER,
     grok_session_id: null,
     messages: [],
     created_at: t,
@@ -926,11 +954,54 @@ function listGrokSkills(includeFile = false) {
   return out;
 }
 
+/**
+ * model.options payload (HTTP and WS share it). The Grok row is kept byte-for-
+ * byte identical to the shape the desktop has always received; the Frozen row
+ * uses only fields ModelOptionProvider declares (name + slug required, warning
+ * omitted rather than null). A 200 with a wrong shape crashes the renderer.
+ */
+function modelOptionsPayload(session, inv) {
+  const local = isLocal(session);
+  const ids = (inv.models || []).map((m) => m.id);
+  const frozenRow = {
+    name: LOCAL_LABEL,
+    slug: LOCAL_SLUG,
+    is_current: local,
+    authenticated: true,
+    auth_type: "local",
+    models: ids,
+    total_models: ids.length,
+    pricing: {},
+    capabilities: Object.fromEntries(ids.map((id) => [id, { fast: false, reasoning: true }])),
+  };
+  if (inv.warning) frozenRow.warning = inv.warning;
+  return {
+    model: session ? session.model || MODEL : MODEL,
+    provider: local ? LOCAL_SLUG : PROVIDER,
+    providers: [
+      {
+        name: "Grok CLI",
+        slug: PROVIDER,
+        is_current: !local,
+        authenticated: true,
+        auth_type: "cli",
+        key_env: null,
+        warning: null,
+        models: [MODEL],
+        total_models: 1,
+        pricing: {},
+        capabilities: { [MODEL]: { fast: false, reasoning: true } },
+      },
+      frozenRow,
+    ],
+  };
+}
+
 function sessionInfoPayload(s, running) {
   return {
     model: s.model || MODEL,
-    provider: PROVIDER,
-    reasoning_effort: REASONING_EFFORT,
+    provider: isLocal(s) ? LOCAL_SLUG : PROVIDER,
+    reasoning_effort: isLocal(s) ? "" : REASONING_EFFORT,
     service_tier: "",
     fast: false,
     yolo: true, // grok runs with --always-approve
@@ -1893,8 +1964,151 @@ function submitPrompt(session, text) {
     log(`sending ${session.attached_images.length} attachment(s) with turn session=${session.id.slice(0, 8)}`);
     session.attached_images = [];
   }
+  // A model switch made mid-turn lands here, at the next turn start.
+  if (session.pending_model) {
+    session.provider = session.pending_model.provider === LOCAL_SLUG ? LOCAL_SLUG : PROVIDER;
+    session.model = session.pending_model.model;
+    delete session.pending_model;
+    log(`model switch applied session=${session.id.slice(0, 8)} -> ${session.provider}/${session.model}`);
+  }
   upsertSession(session);
-  runGrokTurn(session, forGrok);
+  // Provider dispatch boundary. Grok's CLI path (and its two-account fallback)
+  // is unchanged; a local model id is never handed to grok.exe, and Grok's
+  // resume ids are never handed to the local agent (separate id maps).
+  if (isLocal(session)) runLocalTurn(session, forGrok);
+  else runGrokTurn(session, forGrok);
+}
+
+/**
+ * One visible turn on Frozen Local: the real Hermes agent over ACP. Emits the
+ * same desktop events as runGrokTurn (message.start/delta, reasoning.delta,
+ * tool.start/complete, message.complete, session.info, session.title) and
+ * settles through the same rules: never an empty visible turn, stall/absolute
+ * watchdog, activeTurns lock, queue drain. No Tier 2 reflection (that resumes a
+ * grok session) and no account fallback — and never a silent switch to cloud.
+ */
+function runLocalTurn(session, text) {
+  let full = "";
+  let reasoning = "";
+  let cancelled = false;
+  let autoKillReason = null;
+  let finished = false;
+  const turnStartedAt = Date.now();
+  const sid = session.id;
+
+  log(`turn start session=${sid.slice(0, 8)} provider=${LOCAL_SLUG} model=${session.model} local=${(session.local_session_ids || {})[LOCAL_SLUG] || "-"}`);
+
+  activeTurns.set(sid, {
+    silent: false,
+    startedAt: turnStartedAt,
+    cancel: () => {
+      cancelled = true;
+    },
+  });
+  startTurnKeepalive(session, sid);
+  emit(sid, "session.info", sessionInfoPayload(session, true));
+  emit(sid, "message.start");
+  touchActivity(sid);
+
+  let hardStop = null;
+  const watchdogTimer = setInterval(() => {
+    const now = Date.now();
+    const last = turnActivityAt.get(sid) || turnStartedAt;
+    if (now - turnStartedAt > ABSOLUTE_TIMEOUT_MS) autoKillReason = "absolute";
+    else if (now - last > STALL_TIMEOUT_MS) autoKillReason = "stall";
+    else return;
+    log(`turn ${autoKillReason} session=${sid.slice(0, 8)} provider=${LOCAL_SLUG} elapsed=${now - turnStartedAt}ms sinceActivity=${now - last}ms`);
+    clearInterval(watchdogTimer);
+    cancelled = true; // asks Hermes to cancel over ACP
+    // If Hermes doesn't honor the cancel, don't let it hold Frozen's slot forever.
+    hardStop = setTimeout(() => {
+      if (finished) return;
+      log(`turn ${autoKillReason} session=${sid.slice(0, 8)}: cancel not honored in 30s — restarting the local agent`);
+      frozen.shutdownBridge();
+    }, 30_000);
+    if (typeof hardStop.unref === "function") hardStop.unref();
+  }, WATCHDOG_INTERVAL_MS);
+  if (typeof watchdogTimer.unref === "function") watchdogTimer.unref();
+
+  frozen
+    .runTurn(session, text, {
+      onEvent: (type, payload) => {
+        touchActivity(sid);
+        emit(sid, type, payload);
+      },
+      onText: (t) => {
+        full += t;
+      },
+      onReasoning: (t) => {
+        reasoning += t;
+      },
+      onStatus: (t) => {
+        touchActivity(sid);
+        reasoning += t;
+        emit(sid, "reasoning.delta", { text: t });
+      },
+      isCancelled: () => cancelled,
+    })
+    .catch((e) => ({ status: "error", note: `⚠️ Frozen Local turn failed: ${e.message || e}` }))
+    .then((res) => finishLocal(res || { status: "error", note: "⚠️ Frozen Local turn ended without a result." }));
+
+  function finishLocal(res) {
+    if (finished) return;
+    finished = true;
+    clearInterval(watchdogTimer);
+    if (hardStop) clearTimeout(hardStop);
+
+    let status = res.status || "error";
+    let note = res.note || null;
+    if (autoKillReason) {
+      status = "error";
+      note =
+        autoKillReason === "stall"
+          ? `⚠️ Frozen Local stopped responding — no activity for ${formatDuration(STALL_TIMEOUT_MS)}, so this turn was cancelled automatically. Completed tool steps above are not re-run.`
+          : `⚠️ This turn ran past the ${formatDuration(ABSOLUTE_TIMEOUT_MS)} safety limit and was stopped. Everything up to this point is saved — send a follow-up to continue.`;
+    } else if (cancelled && status !== "error") {
+      status = "interrupted";
+    }
+    if (note) {
+      emit(sid, "message.delta", { text: full ? `\n\n${note}` : note });
+      full = full ? `${full}\n\n${note}` : note;
+    }
+    // Never end a VISIBLE turn with empty text (see EMPTY_TURN_NOTE).
+    if (!String(full).trim()) {
+      full = EMPTY_TURN_NOTE;
+      log(`empty visible turn session=${sid.slice(0, 8)} status=${status} — substituted stop note`);
+    }
+    log(`turn end session=${sid.slice(0, 8)} provider=${LOCAL_SLUG} status=${status} chars=${full.length} reasoning=${reasoning.length}`);
+
+    clearTurnKeepalive(sid);
+    activeTurns.delete(sid);
+    try {
+      session.api_call_count = (session.api_call_count || 0) + 1;
+      session.messages.push({
+        role: "assistant",
+        content: full,
+        reasoning: reasoning || null,
+        timestamp: nowSec(),
+      });
+      if (!session.title && text) session.title = String(text).trim().slice(0, 56);
+      session.updated_at = nowSec();
+      upsertSession(session);
+    } catch (e) {
+      log(`finish persist error session=${sid.slice(0, 8)}: ${e.message}`);
+    }
+
+    emit(sid, "message.complete", {
+      text: full,
+      usage: sessionUsage(session),
+      status,
+      reasoning: reasoning || null,
+    });
+    emit(sid, "session.info", sessionInfoPayload(session, false));
+    emit(sid, "session.title", { session_id: sid, title: session.title || "" });
+
+    if (!cancelled && queuedPrompts.get(sid)?.length) scheduleQueueDrain(session);
+    else queuedPrompts.delete(sid);
+  }
 }
 
 function runOneshot(instructions, input, cb) {
@@ -2085,25 +2299,9 @@ const server = http.createServer(async (req, res) => {
       });
     }
     if (req.method === "GET" && p === "/api/model/options") {
-      return respond(200, {
-        model: MODEL,
-        provider: PROVIDER,
-        providers: [
-          {
-            name: "Grok CLI",
-            slug: PROVIDER,
-            is_current: true,
-            authenticated: true,
-            auth_type: "cli",
-            key_env: null,
-            warning: null,
-            models: [MODEL],
-            total_models: 1,
-            pricing: {},
-            capabilities: { [MODEL]: { fast: false, reasoning: true } },
-          },
-        ],
-      });
+      // Global catalog: no session, so Grok is current (it stays the default).
+      const inv = await frozen.inventory(3000);
+      return respond(200, modelOptionsPayload(null, inv));
     }
     if (req.method === "GET" && p === "/api/model/recommended-default") {
       return respond(200, { provider: PROVIDER, model: MODEL, free_tier: null });
@@ -2125,6 +2323,16 @@ const server = http.createServer(async (req, res) => {
       return respond(200, { tasks, main: { provider: PROVIDER, model: MODEL } });
     }
     if (req.method === "POST" && p === "/api/model/set") {
+      // Settings → Model sets the GLOBAL default. Frozen Local is deliberately
+      // per-chat only (Grok stays the default), so refuse it here with a 4xx —
+      // the desktop catches rejections, whereas a 200 with the wrong shape
+      // would crash the renderer.
+      const body = await readBody(req).catch(() => null);
+      if (body && body.provider === LOCAL_SLUG) {
+        return respond(400, {
+          detail: `${LOCAL_LABEL} is chosen per chat from the chat's model menu. The global default stays Grok.`,
+        });
+      }
       return respond(200, {
         ok: true,
         provider: PROVIDER,
@@ -2646,6 +2854,7 @@ wss.on("connection", (ws) => {
           const session = createSession({
             cwd: params.cwd || DEFAULT_CWD,
             model: params.model || MODEL,
+            provider: params.provider,
             title: params.title,
           });
           ok({
@@ -2668,6 +2877,7 @@ wss.on("connection", (ws) => {
               id: params.session_id || undefined,
               cwd: params.cwd || DEFAULT_CWD,
               model: params.model || MODEL,
+              provider: params.provider,
             });
           }
           const running = activeTurns.has(session.id);
@@ -2893,25 +3103,67 @@ wss.on("connection", (ws) => {
         }
 
         case "model.options": {
-          ok({
-            model: MODEL,
-            provider: PROVIDER,
-            providers: [
-              {
-                name: "Grok CLI",
-                slug: PROVIDER,
-                is_current: true,
-                authenticated: true,
-                auth_type: "cli",
-                key_env: null,
-                warning: null,
-                models: [MODEL],
-                total_models: 1,
-                pricing: {},
-                capabilities: { [MODEL]: { fast: false, reasoning: true } },
-              },
-            ],
-          });
+          const s = params.session_id ? getSession(params.session_id) : null;
+          frozen.inventory(3000).then((inv) => ok(modelOptionsPayload(s, inv)));
+          return;
+        }
+
+        case "config.set": {
+          // Every key except `model` keeps its previous behavior exactly
+          // (acknowledged, no-op — see UNSUPPORTED_OK).
+          if (params.key !== "model") {
+            ok({ ok: true });
+            return;
+          }
+          const sw = parseModelSwitch(params.value);
+          if (!sw) return err(-32602, "invalid model value");
+          const target = params.session_id ? getSession(params.session_id) : null;
+          const provider = sw.provider || (target && target.provider) || PROVIDER;
+          if (provider !== PROVIDER && provider !== LOCAL_SLUG) {
+            return err(4040, `unknown provider: ${provider}`);
+          }
+          // No live session: the desktop treats the pick as UI state and hands
+          // it to the next session.create, so there is nothing to apply here.
+          if (!target) {
+            ok({});
+            return;
+          }
+          const settleSwitch = () => {
+            if (activeTurns.has(target.id)) {
+              // Mid-turn: queue it and apply at the next turn start. The desktop
+              // waits for session.info rather than repainting over the running model.
+              target.pending_model = { provider, model: sw.model };
+              upsertSession(target);
+              log(`model switch deferred session=${target.id.slice(0, 8)} -> ${provider}/${sw.model}`);
+              ok({ deferred: true });
+              return;
+            }
+            target.provider = provider;
+            target.model = sw.model;
+            target.updated_at = nowSec();
+            upsertSession(target);
+            log(`model switch session=${target.id.slice(0, 8)} -> ${provider}/${sw.model}`);
+            ok({});
+            emit(target.id, "session.info", sessionInfoPayload(target, false));
+          };
+          if (provider === LOCAL_SLUG) {
+            // Refuse anything not ALREADY loaded on Frozen: LM Studio would
+            // JIT-load it and evict whatever Bionic is using.
+            frozen.inventory(6000).then((inv) => {
+              if (!inv.models.some((m) => m.id === sw.model)) {
+                const loaded = inv.models.map((m) => m.id).join(", ") || "none";
+                return err(
+                  4041,
+                  inv.ok
+                    ? `${sw.model} isn't loaded on Frozen (loaded: ${loaded}). mjhub won't load models on Frozen — it's shared with Bionic.`
+                    : inv.warning
+                );
+              }
+              settleSwitch();
+            });
+            return;
+          }
+          settleSwitch();
           return;
         }
 

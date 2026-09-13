@@ -1,0 +1,6 @@
+name: grok-deny-mirror
+version: 1.0.0
+description: "Mirror Grok Build's [permission] deny list (~/.grok/config.toml Edit(...) rules) onto this Hermes profile, so a local-model session can never write where Grok Build itself is forbidden to."
+author: "grok-gateway (Frozen Local provider)"
+hooks:
+  - pre_tool_call

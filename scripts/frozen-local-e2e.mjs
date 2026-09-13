@@ -113,18 +113,29 @@ class Client {
 }
 
 /** Submit a prompt and collect that turn's events until message.complete. */
-async function turn(c, sid, text, { timeout = 360000, onFirstDelta } = {}) {
+async function turn(c, sid, text, { timeout = Number(process.env.E2E_TURN_TIMEOUT_MS || 20 * 60 * 1000), onFirstDelta } = {}) {
+  // Frozen is shared with Bionic: a turn may legitimately wait in "waiting for Frozen"
+  // for minutes before it is sent, so the per-turn clock must cover the busy wait.
+  const isStatus = (e) => e.session_id === sid && e.type === "reasoning.delta" && /^(Waiting|Heads-up)/.test(e.payload?.text || "");
   const from = c.events.length;
+  // Surface the gateway's own queue status so a long wait reads as "waiting", not "hung".
+  const printer = setInterval(() => {
+    for (const e of c.events.slice(from)) {
+      if (isStatus(e) && !e._printed) { e._printed = true; console.log(`       [gateway] ${String(e.payload.text).trim()}`); }
+    }
+  }, 1000);
   await c.rpc("prompt.submit", { session_id: sid, text });
   let fired = false;
   const deltaWatch = onFirstDelta
     ? (async () => {
-        await c.waitEvent((e) => c.events.indexOf(e) >= from && e.session_id === sid && (e.type === "message.delta" || e.type === "reasoning.delta"), timeout);
+        // First REAL output — a "Waiting for Frozen" status line doesn't count, or the
+        // Stop test would press Stop while still queued and never test mid-generation Stop.
+        await c.waitEvent((e) => c.events.indexOf(e) >= from && e.session_id === sid && !isStatus(e) && (e.type === "message.delta" || e.type === "reasoning.delta"), timeout);
         fired = true;
         await onFirstDelta();
       })().catch(() => {})
     : null;
-  const done = await c.waitEvent((e) => c.events.indexOf(e) >= from && e.session_id === sid && e.type === "message.complete", timeout);
+  const done = await c.waitEvent((e) => c.events.indexOf(e) >= from && e.session_id === sid && e.type === "message.complete", timeout).finally(() => clearInterval(printer));
   if (deltaWatch && !fired) await Promise.race([deltaWatch, sleep(10)]);
   const evs = c.events.slice(from).filter((e) => e.session_id === sid);
   return { done: done.payload, evs, types: evs.map((e) => e.type) };

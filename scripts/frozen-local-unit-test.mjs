@@ -8,6 +8,9 @@ import {
   settleOpenTools,
   choosePermission,
   upsertModelBlock,
+  modelFromChoice,
+  assessModel,
+  HERMES_CONTEXT_FLOOR,
   LOCAL_SLUG,
 } from "../local-provider.mjs";
 
@@ -96,6 +99,32 @@ ok("preserves the plugins block (deny-mirror stays enabled)", /plugins:\n  enabl
 ok("adds a missing key inside the model block", /\n  streaming: false/.test(upsertModelBlock(yaml, { streaming: "false" })));
 ok("creates the model block when absent", /^model:\n  provider: lmstudio/.test(upsertModelBlock("plugins:\n  enabled: []\n", { provider: "lmstudio" })));
 ok("idempotent (same values -> same text)", upsertModelBlock(yaml, { default: "old-model" }) === yaml);
+
+/* ── modelFromChoice: which model a Hermes session is BOUND to ── */
+ok("strips Hermes' lmstudio: prefix", modelFromChoice("lmstudio:huihui-qwen3.8-27b-abliterated") === "huihui-qwen3.8-27b-abliterated");
+ok("keeps colons inside the model id", modelFromChoice("lmstudio:qwen3:8b@q4_k_m") === "qwen3:8b@q4_k_m");
+ok("empty / missing -> empty string (treated as NOT a match)", modelFromChoice(undefined) === "" && modelFromChoice("") === "");
+ok("a different provider prefix is not silently stripped", modelFromChoice("openrouter:x") === "openrouter:x");
+
+/* ── loadedModelsFrom carries tool capability ── */
+const caps = loadedModelsFrom({ data: [
+  { id: "t", type: "llm", state: "loaded", loaded_context_length: 131072, capabilities: ["tool_use"] },
+  { id: "n", type: "llm", state: "loaded", loaded_context_length: 131072, capabilities: [] },
+  { id: "u", type: "llm", state: "loaded", loaded_context_length: 131072 },
+] });
+ok("tool_use capability -> toolUse true / false / null(unknown)", caps[0].toolUse === true && caps[1].toolUse === false && caps[2].toolUse === null);
+
+/* ── assessModel: refuse what can't run, warn what may struggle ── */
+const big = assessModel({ id: "big", contextLength: 143360, toolUse: true });
+ok("the real Frozen model (143K, tool_use) -> no refusal, no warning", big.refuse === null && big.warn.length === 0);
+const tiny = assessModel({ id: "tiny", contextLength: 4096, toolUse: true });
+ok("LM Studio's small default context (4K) is REFUSED with a fix", !!tiny.refuse && /context/i.test(tiny.refuse) && /LM Studio/.test(tiny.refuse));
+const mid = assessModel({ id: "mid", contextLength: 32768, toolUse: true });
+ok("32K runs but warns (below Hermes' 64K tool-use floor)", mid.refuse === null && mid.warn.length === 1 && mid.warn[0].includes(String(HERMES_CONTEXT_FLOOR / 1000)));
+const notool = assessModel({ id: "nt", contextLength: 143360, toolUse: false });
+ok("not tool-capable -> warning, not refusal", notool.refuse === null && /tool-capable/.test(notool.warn.join(" ")));
+ok("unknown capability (null) is not flagged", assessModel({ id: "u", contextLength: 143360, toolUse: null }).warn.length === 0);
+ok("unknown context (null) is not refused", assessModel({ id: "u", contextLength: null, toolUse: true }).refuse === null);
 
 console.log(`\n  RESULT: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

@@ -35,6 +35,7 @@ import {
   LOCAL_SLUG,
   LOCAL_LABEL,
   parseModelSwitch,
+  assessModel,
 } from "./local-provider.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -3150,7 +3151,8 @@ wss.on("connection", (ws) => {
             // Refuse anything not ALREADY loaded on Frozen: LM Studio would
             // JIT-load it and evict whatever Bionic is using.
             frozen.inventory(6000).then((inv) => {
-              if (!inv.models.some((m) => m.id === sw.model)) {
+              const lm = inv.models.find((m) => m.id === sw.model);
+              if (!lm) {
                 const loaded = inv.models.map((m) => m.id).join(", ") || "none";
                 return err(
                   4041,
@@ -3159,6 +3161,9 @@ wss.on("connection", (ws) => {
                     : inv.warning
                 );
               }
+              // Loaded, but with too little context for the agent to run at all.
+              const verdict = assessModel(lm);
+              if (verdict.refuse) return err(4042, verdict.refuse);
               settleSwitch();
             });
             return;

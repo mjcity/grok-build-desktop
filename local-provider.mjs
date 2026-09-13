@@ -39,6 +39,11 @@ import * as acp from "@agentclientprotocol/sdk";
 export const LOCAL_SLUG = "frozen-local";
 export const LOCAL_LABEL = "Frozen Local";
 
+/** Hermes' own floor for reliable tool calling (agent/model_metadata.py MINIMUM_CONTEXT_LENGTH). */
+export const HERMES_CONTEXT_FLOOR = 64_000;
+/** Below this the agent can't run at all: its instructions + tool schemas alone measured ~7.3K tokens. */
+export const MIN_AGENT_CONTEXT = Number(process.env.FROZEN_MIN_CONTEXT || 16_384);
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const firstLine = (s) =>
   String(s || "")
@@ -82,7 +87,46 @@ export function loadedModelsFrom(payload) {
       contextLength: m.loaded_context_length || null,
       maxContextLength: m.max_context_length || null,
       type: m.type,
+      // true / false from LM Studio's capabilities; null when it doesn't say.
+      toolUse: Array.isArray(m.capabilities) ? m.capabilities.includes("tool_use") : null,
     }));
+}
+
+/**
+ * Hermes reports a session's model as "<provider>:<model>" (acp_adapter
+ * model_catalog.encode_model_choice). Strip exactly the provider prefix — LM
+ * Studio model ids may themselves contain colons.
+ */
+export function modelFromChoice(choice) {
+  const s = String(choice || "");
+  return s.startsWith("lmstudio:") ? s.slice("lmstudio:".length) : s;
+}
+
+/**
+ * Is this loaded model usable by the agent? `refuse` blocks selection and turns;
+ * `warn` is shown in the picker and once when a chat first uses the model.
+ */
+export function assessModel(m, minContext = MIN_AGENT_CONTEXT) {
+  const out = { refuse: null, warn: [] };
+  if (!m) return out;
+  const ctx = m.contextLength;
+  if (typeof ctx === "number" && ctx > 0) {
+    if (ctx < minContext) {
+      out.refuse =
+        `${m.id} is loaded with only ${ctx.toLocaleString("en-US")} tokens of context — too small for the local agent ` +
+        `(its instructions and tool list alone take about 7-8K). Reload it in LM Studio with at least ` +
+        `${HERMES_CONTEXT_FLOOR / 1000}K context.`;
+    } else if (ctx < HERMES_CONTEXT_FLOOR) {
+      out.warn.push(
+        `${m.id} is loaded with ${ctx.toLocaleString("en-US")} context; Hermes recommends at least ` +
+          `${HERMES_CONTEXT_FLOOR / 1000}K for reliable tool use, so long tasks may lose track.`
+      );
+    }
+  }
+  if (m.toolUse === false) {
+    out.warn.push(`LM Studio doesn't mark ${m.id} as tool-capable, so the agent's tool use may be unreliable.`);
+  }
+  return out;
 }
 
 /**
@@ -388,7 +432,11 @@ export function createFrozenLocal({ log, dataDir, repoDir, defaultCwd }) {
         PYTHONUTF8: "1",
       },
     });
-    const rec = { child, handlers: new Map(), opened: new Set(), stderr: "", model };
+    // sessionModels: Hermes session id -> the model Hermes has that session BOUND
+    // to (from its own currentModelId). A resumed session keeps the model it was
+    // created with, regardless of the profile default, so this — not the chat's
+    // setting — is what decides whether a session is safe to prompt.
+    const rec = { child, handlers: new Map(), sessionModels: new Map(), stderr: "", model };
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (d) => { rec.stderr = (rec.stderr + d).slice(-6000); });
     child.on("exit", (code) => {
@@ -470,7 +518,14 @@ export function createFrozenLocal({ log, dataDir, repoDir, defaultCwd }) {
     async inventory(budgetMs = 4000) {
       try {
         const loaded = await Promise.race([ensureRoute(), sleep(budgetMs).then(() => { throw fail("TIMEOUT", "Frozen didn't answer in time"); })]);
-        return { ok: true, models: loaded, warning: loaded.length ? null : "Frozen has no chat model loaded right now." };
+        if (!loaded.length) return { ok: true, models: loaded, warning: "Frozen has no chat model loaded right now." };
+        const notes = [];
+        for (const m of loaded) {
+          const a = assessModel(m);
+          if (a.refuse) notes.push(a.refuse);
+          notes.push(...a.warn);
+        }
+        return { ok: true, models: loaded, warning: notes.length ? notes.join(" ") : null };
       } catch (e) {
         return { ok: false, models: lastLoaded, warning: `Frozen unavailable: ${e.message}` };
       }
@@ -499,10 +554,13 @@ export function createFrozenLocal({ log, dataDir, repoDir, defaultCwd }) {
       if (!loaded.length) {
         return { status: "error", note: "⚠️ Frozen has no chat model loaded right now, so there's nothing to run. mjhub won't load one itself (Frozen is shared with Bionic) — load a model in LM Studio on Frozen, then try again." };
       }
-      if (!loaded.some((m) => m.id === session.model)) {
+      const loadedModel = loaded.find((m) => m.id === session.model);
+      if (!loadedModel) {
         const names = loaded.map((m) => m.id).join(", ");
         return { status: "error", note: `⚠️ This chat is set to \`${session.model}\`, but Frozen currently has only ${names} loaded. mjhub won't load a different model on Frozen (it's shared with Bionic). Pick the loaded model from the model menu.` };
       }
+      const assessment = assessModel(loadedModel);
+      if (assessment.refuse) return { status: "error", note: `⚠️ ${assessment.refuse}` };
 
       // 2) one request at a time across the whole gateway
       const slot = acquireSlot(label);
@@ -536,25 +594,72 @@ export function createFrozenLocal({ log, dataDir, repoDir, defaultCwd }) {
         } catch (e) {
           return { status: "error", note: `⚠️ Couldn't start the local Hermes agent: ${e.message}` };
         }
+        // One Hermes session per (chat, model). A Hermes session stays bound to
+        // the model it was created with — its restore path rebuilds the agent
+        // from the STORED model, not the profile default — so reusing a chat's
+        // session after a model swap would make Hermes request the OLD model,
+        // and LM Studio would JIT-load it and evict Bionic's. (Reproduced with
+        // scripts/frozen-local-swap-e2e.mjs before this fix.) Switching back to
+        // a model resumes that model's own session, history included.
         session.local_session_ids = session.local_session_ids || {};
-        let acpSessionId = session.local_session_ids[LOCAL_SLUG] || null;
+        const ids = session.local_session_ids;
+        const key = `${LOCAL_SLUG}:${session.model}`;
+        let candidate = ids[key] || null;
+        const legacy = !candidate && !!ids[LOCAL_SLUG]; // pre-fix format: model unknown, must be verified
+        if (legacy) candidate = ids[LOCAL_SLUG];
         const cwd = session.cwd && fs.existsSync(session.cwd) ? session.cwd : defaultCwd;
-        if (acpSessionId && !b.opened.has(acpSessionId)) {
-          try {
-            await b.conn.resumeSession({ sessionId: acpSessionId, cwd, mcpServers: [] });
-            b.opened.add(acpSessionId);
-            log(`frozen: resumed hermes session ${acpSessionId.slice(0, 8)} for chat ${session.id.slice(0, 8)}`);
-          } catch (e) {
-            log(`frozen: resume ${acpSessionId.slice(0, 8)} failed (${e.message}) — starting a fresh local session`);
-            acpSessionId = null;
+        let acpSessionId = null;
+
+        if (candidate) {
+          const known = b.sessionModels.get(candidate);
+          if (known === session.model) {
+            acpSessionId = candidate; // already open in this Hermes process, on the right model
+          } else if (known === undefined) {
+            try {
+              // Resume replays the session's history as session/update events BEFORE it
+              // returns. No handler is registered for this session yet, so that replay is
+              // dropped rather than re-streamed into the chat — keep it that way.
+              const r = await b.conn.resumeSession({ sessionId: candidate, cwd, mcpServers: [] });
+              const bound = modelFromChoice(r && r.models && r.models.currentModelId);
+              b.sessionModels.set(candidate, bound);
+              if (bound === session.model) {
+                acpSessionId = candidate;
+                log(`frozen: resumed hermes session ${candidate.slice(0, 8)} for chat ${session.id.slice(0, 8)} model=${bound}`);
+              } else {
+                log(`frozen: hermes session ${candidate.slice(0, 8)} is bound to ${bound || "an unknown model"}, not ${session.model} — not using it (it would request a model that isn't loaded)`);
+              }
+            } catch (e) {
+              log(`frozen: resume ${candidate.slice(0, 8)} failed (${e.message})`);
+            }
+          } else {
+            log(`frozen: hermes session ${candidate.slice(0, 8)} is bound to ${known}, not ${session.model} — not using it`);
+          }
+          if (legacy) {
+            delete ids[LOCAL_SLUG];
+            if (acpSessionId) ids[key] = acpSessionId;
           }
         }
+
         if (!acpSessionId) {
           const created = await b.conn.newSession({ cwd, mcpServers: [] });
+          const bound = modelFromChoice(created.models && created.models.currentModelId);
+          b.sessionModels.set(created.sessionId, bound);
+          if (bound !== session.model) {
+            // Never prompt a session that isn't on the loaded model — that is the
+            // exact request that would make LM Studio load something else.
+            log(`frozen: new hermes session came up on ${bound || "an unknown model"}, expected ${session.model} — turn NOT sent`);
+            return { status: "error", note: `⚠️ The local agent started on ${bound || "an unknown model"} instead of \`${session.model}\`, so this turn was not sent (it would have asked Frozen to load a model that isn't loaded). Try again; if it repeats, restart Grok Build.` };
+          }
           acpSessionId = created.sessionId;
-          session.local_session_ids[LOCAL_SLUG] = acpSessionId;
-          b.opened.add(acpSessionId);
-          log(`frozen: new hermes session ${acpSessionId.slice(0, 8)} for chat ${session.id.slice(0, 8)} cwd=${cwd}`);
+          ids[key] = acpSessionId;
+          log(`frozen: new hermes session ${acpSessionId.slice(0, 8)} for chat ${session.id.slice(0, 8)} model=${bound} cwd=${cwd}`);
+        }
+
+        // Heads-up (once per chat per model) for a model that works but has caveats.
+        session.local_warned = session.local_warned || {};
+        if (assessment.warn.length && !session.local_warned[session.model]) {
+          session.local_warned[session.model] = true;
+          hooks.onStatus(`Heads-up: ${assessment.warn.join(" ")}\n`);
         }
 
         // 5) the turn

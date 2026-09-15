@@ -171,8 +171,18 @@ async function turn(c, sid, text, { timeout = Number(process.env.E2E_TURN_TIMEOU
   const created = await c.rpc("session.create", { cwd: work });
   const sid = created.session_id;
   ok("new chat defaults to Grok", created.info.provider === "grok-cli");
-  const refused = await c.rpc("config.set", { session_id: sid, key: "model", value: "google/gemma-4-31b --provider frozen-local --session" }).then(() => null, (e) => e);
-  ok("switching to a NOT-loaded Frozen model is refused (no JIT load)", refused && refused.code === 4041, refused ? refused.message : "accepted");
+  // Re-aimed 2026-09-15: the menu lists every downloaded model; picking an
+  // unloaded one over the loaded model ASKS to confirm — nothing is loaded or
+  // unloaded on Frozen until the user says yes (this test never does).
+  ok("Frozen row also offers models that are downloaded but not loaded", !!frozenRow0 && frozenRow0.models.length > 1, frozenRow0 && JSON.stringify(frozenRow0.models));
+  const NOT_LOADED = frozenRow0 ? frozenRow0.models.find((id) => id !== LOADED) : "google/gemma-4-31b";
+  const askFirst = await c.rpc("config.set", { session_id: sid, key: "model", value: `${NOT_LOADED} --provider frozen-local --session` }, 90000).then((r) => r, (e) => e);
+  ok("switching to a NOT-loaded Frozen model asks to confirm (no JIT load, no unload)",
+    askFirst && askFirst.confirm_required === true && String(askFirst.confirm_message).includes(LOADED) && String(askFirst.confirm_message).includes(NOT_LOADED),
+    askFirst ? (askFirst.message || JSON.stringify(askFirst)) : "accepted");
+  const afterAsk = await frozenSnapshot();
+  ok("…and Frozen is untouched (same models loaded as before)", afterAsk === before, `before=${before} now=${afterAsk}`);
+  ok("…and the chat is still on Grok (unconfirmed pick changes nothing)", (await c.rpc("session.resume", { session_id: sid })).info.provider === "grok-cli");
   const switched = await c.rpc("config.set", { session_id: sid, key: "model", value: `${LOADED} --provider frozen-local --session` }, 90000);
   ok("switching to the loaded Frozen model is accepted", switched && !switched.deferred);
   const info = await c.waitEvent((e) => e.session_id === sid && e.type === "session.info" && e.payload.provider === "frozen-local", 15000).catch(() => null);

@@ -17,16 +17,20 @@
  *    local turn runs across the whole gateway; callers wait for the slot, and we
  *    look at Frozen's own queue so the user sees "waiting for Bionic" instead of
  *    a silent hang.
- *  - Never load over someone else's model. Loading is allowed ONLY when Frozen
- *    has no chat model loaded at all (Michael's call, 2026-09-13: LM Studio Bionic
- *    idle-unloads after an hour, and restarts come back empty). The decision is
- *    re-made from a fresh probe while holding the Frozen slot, the load goes
- *    through `lms load` with the context the model last ran with and a 1-hour
- *    TTL, and success is confirmed on LM Studio's own list before anything is
- *    sent. If ANY other model is loaded, the turn is refused — never swapped.
- *    The Hermes profile runs lmstudio_load_mode=jit so Hermes itself never
- *    preloads, and turns only name a model that is already loaded (LM Studio
- *    would JIT-load any DOWNLOADED model a request names, evicting Bionic's).
+ *  - Never replace someone else's model without a confirm. Loading into an
+ *    EMPTY Frozen is automatic (Michael's call, 2026-09-13: LM Studio Bionic
+ *    idle-unloads after an hour, and restarts come back empty). Replacing a
+ *    loaded model — probably Bionic's — happens only after the user confirmed
+ *    that exact swap in the model menu (2026-09-15, parity with original
+ *    Hermes' picker: every downloaded model is offered). The decision is re-made
+ *    from a fresh probe while holding the Frozen slot; a swap token is honoured
+ *    only while Frozen still holds exactly the models it named, the old model is
+ *    unloaded (verified) once Frozen is idle, the load goes through `lms load`
+ *    with a 1-hour TTL, and success is confirmed on LM Studio's own list before
+ *    anything is sent. The Hermes profile runs lmstudio_load_mode=jit so Hermes
+ *    itself never preloads, and turns only name a model that is already loaded
+ *    (LM Studio would JIT-load any DOWNLOADED model a request names, evicting
+ *    Bionic's).
  *  - Only ever stop the tunnel THIS process started. Never kill another app's ssh.
  *  - Never fall back to the cloud. A local failure is a clear local error.
  *  - Grok Build's [permission] deny list is mirrored into the profile by the
@@ -114,7 +118,7 @@ export function downloadedModelsFrom(payload) {
  * What may a chat do with Frozen as it is right now? Pure.
  *   use            the chat's model is loaded
  *   load           NOTHING is loaded and the model is downloaded — loading it evicts nothing
- *   other-loaded   a different model is loaded (likely Bionic's) — never swap it out
+ *   other-loaded   a different model is loaded (likely Bionic's) — replace only after a confirm
  *   not-downloaded nothing to load
  */
 export function planModel(target, { loaded, downloaded }) {

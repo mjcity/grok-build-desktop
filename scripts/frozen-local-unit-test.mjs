@@ -17,6 +17,10 @@ import {
   chooseLoadContext,
   isSafeModelId,
   lmsLoadCommand,
+  lmsUnloadCommand,
+  swapDecision,
+  swapConfirmMessage,
+  hermesConfigContexts,
   LOCAL_SLUG,
 } from "../local-provider.mjs";
 
@@ -147,7 +151,8 @@ const naivePlan = (t, { downloaded }) => (downloaded.find((m) => m.id === t) ? {
 ok("MUTATION: ignoring the loaded list would load over Bionic's model (the rule has teeth)",
   naivePlan("google/gemma-4-31b", { loaded: Lh, downloaded: Dl }).action === "load" && planModel("google/gemma-4-31b", { loaded: Lh, downloaded: Dl }).action !== "load");
 const refOther = planRefusal(planModel("google/gemma-4-31b", { loaded: Lh, downloaded: Dl }), "google/gemma-4-31b");
-ok("refusal text: other-loaded names the loaded model and says it won't swap", /isn't loaded/.test(refOther) && refOther.includes(HUI) && /won't swap/.test(refOther));
+// Re-aimed 2026-09-15: a swap is possible now, but only after the user confirms — the text must say so.
+ok("refusal text: other-loaded names the loaded model and says a swap needs your confirm", /isn't loaded/.test(refOther) && refOther.includes(HUI) && /after you confirm/.test(refOther));
 ok("refusal text never says 'mjhub' (wrong app)", !/mjhub/i.test(refOther + planRefusal({ action: "not-downloaded" }, "x")));
 ok("refusal: use/load -> null", planRefusal({ action: "use" }, "x") === null && planRefusal({ action: "load" }, "x") === null);
 ok("load context: remembered value wins", chooseLoadContext({ maxContextLength: 262144 }, { contextLength: 143360 }) === 143360);
@@ -158,6 +163,42 @@ ok("safe ids: real LM Studio ids pass", ["huihui-qwen3.8-27b-abliterated", "goog
 ok("load command: exact production string", lmsLoadCommand(HUI, 143360, 3600) === `lms load "${HUI}" --context-length 143360 --ttl 3600 --identifier "${HUI}" -y`);
 ok("load command: estimate-only variant only adds the flag", lmsLoadCommand(HUI, 143360, 3600, { estimateOnly: true }) === `lms load "${HUI}" --context-length 143360 --ttl 3600 --identifier "${HUI}" --estimate-only -y`);
 ok("load command: refuses an unsafe id and bad numbers", [() => lmsLoadCommand('x" & calc', 1, 1), () => lmsLoadCommand(HUI, 0, 3600), () => lmsLoadCommand(HUI, 143360, NaN)].every((f) => { try { f(); return false; } catch { return true; } }));
+/* ── swap-with-confirm policy (2026-09-15, parity with original Hermes) ── */
+const G = "google/gemma-4-31b";
+const other = planModel(G, { loaded: Lh, downloaded: Dl }); // huihui loaded, user wants gemma
+ok("swap: no token -> not allowed, needs confirm, names what it would replace",
+  eq(swapDecision(other, G, undefined), { allowed: false, needsConfirm: true, replacing: [HUI] }));
+ok("swap: matching token -> allowed", swapDecision(other, G, { to: G, replacing: [HUI] }).allowed === true);
+ok("swap: token for a different target is not honored", swapDecision(other, G, { to: "x", replacing: [HUI] }).allowed === false);
+ok("swap: token no longer matches what's loaded (Bionic swapped) -> not allowed", swapDecision(other, G, { to: G, replacing: ["something-else"] }).allowed === false);
+ok("swap: token must cover EVERY loaded model", swapDecision({ action: "other-loaded", loaded: [{ id: HUI }, { id: "k" }] }, G, { to: G, replacing: [HUI] }).allowed === false);
+ok("swap: 'use' and 'load' plans never need a confirm", !swapDecision({ action: "use" }, G, null).needsConfirm && !swapDecision({ action: "load" }, G, null).needsConfirm);
+// MUTATION: a decision that ignores the token would let any turn evict Bionic's model.
+const naiveSwap = (plan) => ({ allowed: plan.action === "other-loaded" });
+ok("MUTATION: ignoring the token would allow an unconfirmed eviction (gate has teeth)", naiveSwap(other).allowed && !swapDecision(other, G, undefined).allowed);
+const msg = swapConfirmMessage(G, [HUI]);
+ok("confirm message names both models and says it unloads on the next message", msg.includes(HUI) && msg.includes(G) && /unload/.test(msg) && /next message/.test(msg));
+ok("refusal after Bionic reloads tells the user how to re-confirm", /pick .* again and confirm/i.test(planRefusal(other, G)));
+ok("unload command: exact string, one model, never --all", lmsUnloadCommand(HUI) === `lms unload "${HUI}"` && !/--all|-a\b/.test(lmsUnloadCommand(HUI)));
+ok("unload command: refuses an unsafe id", (() => { try { lmsUnloadCommand('x"; rm -rf /'); return false; } catch { return true; } })());
+
+/* ── original Hermes config.yaml contexts (shape copied from the real file) ── */
+const yamlReal = [
+  "model:", "  default: huihui-qwen3.8-27b-abliterated", "  provider: lmstudio", "  base_url: http://127.0.0.1:12345/v1",
+  "providers:", "  lmstudio:", "    name: OG Frozen (LM Studio)", "    base_url: http://127.0.0.1:12345/v1",
+  "    model: huihui-qwen3.8-27b-abliterated", "    discover_models: true", "    models:",
+  "      huihui-qwen3.8-27b-abliterated:", "        context_length: 143360",
+  "      google/gemma-4-31b: {}", "      zai-org/glm-4.7-flash: {}", "      qwen3.6-35b-a3b:", "        context_length: 98304",
+  "    api_mode: chat_completions", "plugins:", "  enabled: []",
+].join("\n");
+const ctxs = hermesConfigContexts(yamlReal);
+ok("hermes config: reads context_length per model", ctxs[HUI] === 143360 && ctxs["qwen3.6-35b-a3b"] === 98304);
+ok("hermes config: models with {} contribute nothing", !("google/gemma-4-31b" in ctxs) && Object.keys(ctxs).length === 2);
+ok("hermes config: missing providers block -> empty, no throw", eq(hermesConfigContexts("model:\n  default: x\n"), {}) && eq(hermesConfigContexts(""), {}));
+ok("load context: original Hermes' setting beats the default, loses to a remembered run",
+  chooseLoadContext({ maxContextLength: 262144 }, undefined, { hermes: 98304 }) === 98304 &&
+  chooseLoadContext({ maxContextLength: 262144 }, { contextLength: 143360 }, { hermes: 98304 }) === 143360);
+
 ok("safe ids: shell metacharacters are rejected", ['a" && calc', "a;b", "a|b", "a&b", "a`b`", "$(x)", "a b", "a\nb", "", "-rf"].every((s) => !isSafeModelId(s)));
 
 console.log(`\n  RESULT: ${pass} passed, ${fail} failed`);

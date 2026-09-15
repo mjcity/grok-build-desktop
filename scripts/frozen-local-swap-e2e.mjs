@@ -135,7 +135,8 @@ async function quiesce(mock, quietMs = 4000, maxMs = 60000) {
 
   const opts = await c.rpc("model.options", { session_id: sid }, 30000);
   const row = opts.providers.find((p) => p.slug === "frozen-local");
-  ok("picker now offers ONLY the newly loaded model", row && row.models.length === 1 && row.models[0] === B.id, row && JSON.stringify(row.models));
+  // Re-aimed 2026-09-15: the menu lists every downloaded model; the LOADED one comes first.
+  ok("picker now lists the newly loaded model first", row && row.models[0] === B.id && /Loaded now: .*bravo/.test(row.warning || ""), row && JSON.stringify([row.models, row.warning]));
 
   const stale = await turn(c, sid, "Are you still there?");
   ok("chat still set to the unloaded model is refused, not sent", stale.status === "error" && /isn't loaded|currently has only/i.test(stale.text), String(stale.text).slice(0, 200));

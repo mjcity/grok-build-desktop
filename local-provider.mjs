@@ -132,9 +132,9 @@ export function planRefusal(plan, target) {
   if (plan.action === "other-loaded") {
     const names = plan.loaded.map((m) => m.id).join(", ");
     return (
-      `\`${target}\` isn't loaded on Frozen — it has ${names} loaded right now (probably Bionic's). ` +
-      `Grok Build won't swap out a model that's already loaded. Pick ${names} from the model menu, ` +
-      `or unload it in LM Studio on Frozen and try again.`
+      `\`${target}\` isn't loaded on Frozen — it has ${names} loaded right now (probably Bionic's), ` +
+      `and Grok Build only replaces a loaded model after you confirm. Pick \`${target}\` in the model menu ` +
+      `again and confirm replacing ${names}, or pick ${names} to use what's loaded.`
     );
   }
   if (plan.action === "not-downloaded") {
@@ -143,12 +143,89 @@ export function planRefusal(plan, target) {
   return null;
 }
 
+const sameIdSet = (a, b) => {
+  const A = [...new Set(a)].sort(), B = [...new Set(b)].sort();
+  return A.length === B.length && A.every((x, i) => x === B[i]);
+};
+
+/**
+ * May this turn replace what's loaded? Only with a swap token the user earned
+ * by confirming in the model menu, and only while Frozen still holds exactly
+ * the models that confirm was about — if Bionic loaded something else in the
+ * meantime, the user never agreed to evict it. Pure.
+ *   { allowed:true, replacing:[ids] } | { allowed:false, needsConfirm:true, replacing:[ids] }
+ */
+export function swapDecision(plan, target, token) {
+  const replacing = (plan && plan.loaded ? plan.loaded : []).map((m) => m.id);
+  if (!plan || plan.action !== "other-loaded") return { allowed: false, needsConfirm: false, replacing };
+  const ok = !!token && token.to === target && Array.isArray(token.replacing) && sameIdSet(token.replacing, replacing);
+  return ok ? { allowed: true, replacing } : { allowed: false, needsConfirm: true, replacing };
+}
+
+/** The confirm shown by the desktop before a swap. Pure. */
+export function swapConfirmMessage(target, replacing) {
+  const names = replacing.join(", ");
+  return (
+    `Frozen currently has ${names} loaded — possibly in use by Bionic. Switching this chat to ` +
+    `\`${target}\` will unload ${names} and load \`${target}\` on your next message (about a minute). ` +
+    `Continue?`
+  );
+}
+
+/**
+ * Per-model context lengths from original Hermes' config.yaml
+ * (`providers: lmstudio: models: <id>: context_length: N`) — the settings
+ * Michael already maintains for the same models. Minimal indentation-aware
+ * parse; no YAML dependency in the gateway. Pure.
+ */
+export function hermesConfigContexts(yamlText) {
+  const out = {};
+  const lines = String(yamlText || "").split(/\r?\n/);
+  const indent = (l) => l.match(/^\s*/)[0].length;
+  let i = lines.findIndex((l) => /^providers:\s*$/.test(l));
+  if (i < 0) return out;
+  const provIndent = indent(lines[i]);
+  // find `lmstudio:` inside providers
+  let j = i + 1;
+  while (j < lines.length && (lines[j].trim() === "" || indent(lines[j]) > provIndent)) {
+    if (/^\s*lmstudio:\s*$/.test(lines[j])) break;
+    j++;
+  }
+  if (j >= lines.length || !/^\s*lmstudio:\s*$/.test(lines[j])) return out;
+  const lmIndent = indent(lines[j]);
+  let k = j + 1;
+  while (k < lines.length && (lines[k].trim() === "" || indent(lines[k]) > lmIndent)) {
+    if (/^\s*models:\s*$/.test(lines[k])) break;
+    k++;
+  }
+  if (k >= lines.length || !/^\s*models:\s*$/.test(lines[k])) return out;
+  const modelsIndent = indent(lines[k]);
+  let current = null;
+  for (let n = k + 1; n < lines.length; n++) {
+    const l = lines[n];
+    if (l.trim() === "") continue;
+    const ind = indent(l);
+    if (ind <= modelsIndent) break;
+    const key = l.match(/^\s*("?)([^":#]+(?::[^":#]+)*)\1:\s*(.*)$/);
+    if (!key) continue;
+    if (ind === modelsIndent + 2) { current = key[2].trim(); continue; }
+    if (current && key[2].trim() === "context_length") {
+      const v = Number(key[3].trim());
+      if (Number.isFinite(v) && v > 0) out[current] = v;
+    }
+  }
+  return out;
+}
+
 /**
  * Context to load a model with: what it last ran with (remembered), else a
  * Hermes-safe default, never above the model's own maximum. Pure.
  */
-export function chooseLoadContext(model, remembered, { override = null, fallback = 65536 } = {}) {
-  const want = Number(override) > 0 ? Number(override) : (remembered && remembered.contextLength) || fallback;
+export function chooseLoadContext(model, remembered, { override = null, hermes = null, fallback = 65536 } = {}) {
+  // Priority: explicit override > what it last ran with here > original Hermes' setting > default.
+  const want =
+    Number(override) > 0 ? Number(override)
+    : (remembered && remembered.contextLength) || (Number(hermes) > 0 ? Number(hermes) : 0) || fallback;
   const max = model && model.maxContextLength;
   return Math.floor(max ? Math.min(want, max) : want);
 }
@@ -173,6 +250,12 @@ export function lmsLoadCommand(id, contextLength, ttlSeconds, { estimateOnly = f
   const ttl = Math.floor(Number(ttlSeconds));
   if (!(ctx > 0) || !(ttl > 0)) throw new Error(`invalid load numbers ctx=${contextLength} ttl=${ttlSeconds}`);
   return `lms load "${id}" --context-length ${ctx} --ttl ${ttl} --identifier "${id}"${estimateOnly ? " --estimate-only" : ""} -y`;
+}
+
+/** `lms unload "<identifier>"` — one model, never `--all` (that would take the embedding model too). Pure. */
+export function lmsUnloadCommand(id) {
+  if (!isSafeModelId(id)) throw new Error(`unsafe model id: ${id}`);
+  return `lms unload "${id}"`;
 }
 
 /**
@@ -333,6 +416,10 @@ export function createFrozenLocal({ log, dataDir, repoDir, defaultCwd }) {
     loadContext: env.FROZEN_LOAD_CONTEXT ? Number(env.FROZEN_LOAD_CONTEXT) : null,
     loadTimeoutMs: Number(env.FROZEN_LOAD_TIMEOUT_MS || 5 * 60 * 1000),
     modelsFile: path.join(dataDir, "frozen-models.json"), // context each model last ran with
+    // Original Hermes' config.yaml: its `providers.lmstudio.models.<id>.context_length`
+    // entries are reused as the context for models this gateway hasn't run yet.
+    hermesConfig: env.FROZEN_HERMES_CONFIG ||
+      path.join(env.HERMES_HOME || path.join(env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "hermes"), "config.yaml"),
   };
   const baseUrl = `http://127.0.0.1:${cfg.localPort}/v1`;
 
@@ -415,6 +502,23 @@ export function createFrozenLocal({ log, dataDir, repoDir, defaultCwd }) {
     }
   }
 
+  let hermesCtxCache = { mtime: null, map: {} };
+  function readHermesContexts() {
+    try {
+      const mtime = fs.statSync(cfg.hermesConfig).mtimeMs;
+      if (hermesCtxCache.mtime !== mtime) {
+        hermesCtxCache = { mtime, map: hermesConfigContexts(fs.readFileSync(cfg.hermesConfig, "utf8")) };
+      }
+    } catch {
+      hermesCtxCache = { mtime: null, map: {} };
+    }
+    return hermesCtxCache.map;
+  }
+  /** Context to load `model` with (override > last run here > original Hermes' setting > 64K). */
+  function contextFor(model) {
+    return chooseLoadContext(model, readRemembered()[model.id], { override: cfg.loadContext, hermes: readHermesContexts()[model.id] });
+  }
+
   async function probeLoaded() {
     let res;
     try {
@@ -457,6 +561,27 @@ export function createFrozenLocal({ log, dataDir, repoDir, defaultCwd }) {
     const why = lastLine(r.stderr) || lastLine(r.stdout) || `lms exited with code ${r.code}`;
     log(`frozen: load of ${model.id} failed: ${why}`);
     throw fail("LOAD", why);
+  }
+
+  /**
+   * Unload one chat model on Frozen. Called ONLY inside a user-confirmed swap,
+   * after Frozen is idle. Verified against LM Studio's list, not the exit code.
+   */
+  async function unloadModel(id) {
+    const cmd = lmsUnloadCommand(id);
+    log(`frozen: unloading ${id} (user-confirmed swap)`);
+    const r = await sshRun(cmd, 60_000);
+    for (let i = 0; i < 20; i++) {
+      let loaded = null;
+      try { loaded = await probeLoaded(); } catch { /* retry */ }
+      if (loaded && !loaded.some((m) => m.id === id)) {
+        log(`frozen: unloaded ${id} (lms exit ${r.code})`);
+        return;
+      }
+      await sleep(1000);
+    }
+    const why = lastLine(r.stderr) || lastLine(r.stdout) || `lms exited with code ${r.code}`;
+    throw fail("UNLOAD", `${id} is still loaded after unload: ${why}`);
   }
 
   const tunnelAlive = () => !!(tunnel && tunnel.proc.exitCode === null);
@@ -527,19 +652,40 @@ export function createFrozenLocal({ log, dataDir, repoDir, defaultCwd }) {
     return routePromise;
   }
 
-  /* ── Frozen's own queue: is Bionic using the model? ── */
+  /* ── Frozen's own queue: is ANY loaded model busy (Bionic, original Hermes, us)? ── */
   let busyCache = { at: 0, value: null };
-  async function busyState(modelId) {
+  async function anyBusy() {
     if (Date.now() - busyCache.at < 2500) return busyCache.value;
     const r = await sshRun("lms ps --json", 12_000);
-    let value = null;
+    let value = null; // null = unknown → don't block on it
     try {
       const arr = JSON.parse(r.stdout);
-      const m = arr.find((x) => x.identifier === modelId) || null;
-      if (m) value = { status: String(m.status || ""), queued: Number(m.queued || 0), parallel: Number(m.parallel || 1) };
-    } catch { /* unknown — don't block on it */ }
+      const busy = arr.filter((x) => x.type !== "embedding" && (String(x.status || "") !== "idle" || Number(x.queued || 0) > 0));
+      value = busy.length
+        ? { busy: true, detail: busy.map((x) => `${x.identifier}: ${x.status}${x.queued ? `, ${x.queued} queued` : ""}`).join("; ") }
+        : { busy: false, detail: "" };
+    } catch { /* unknown */ }
     busyCache = { at: Date.now(), value };
     return value;
+  }
+  /** Block until Frozen is idle (or cancelled / out of patience). Returns null when clear, else a result to return. */
+  async function waitIdle(hooks, what) {
+    const t0 = Date.now();
+    let announced = false;
+    for (;;) {
+      const b = await anyBusy().catch(() => null);
+      if (!b || !b.busy) return null;
+      if (!announced) {
+        hooks.onStatus(`Waiting for Frozen before ${what} — a model is busy (${b.detail}), probably Bionic.\n`);
+        announced = true;
+      }
+      if (hooks.isCancelled()) return { status: "interrupted" };
+      if (Date.now() - t0 > cfg.busyMaxWaitMs) {
+        return { status: "error", note: `⚠️ Frozen stayed busy for over ${Math.round(cfg.busyMaxWaitMs / 60000)} minutes, so this turn was not sent. Try again when Bionic is done.` };
+      }
+      await sleep(3000);
+      busyCache.at = 0;
+    }
   }
 
   /* ── the Hermes profile (versioned in the repo, synced into the data dir) ── */
@@ -683,25 +829,25 @@ export function createFrozenLocal({ log, dataDir, repoDir, defaultCwd }) {
     async inventory(budgetMs = 4000) {
       try {
         const loaded = await Promise.race([ensureRoute(), sleep(budgetMs).then(() => { throw fail("TIMEOUT", "Frozen didn't answer in time"); })]);
-        if (!loaded.length) {
-          // Nothing loaded: offer the downloaded models this gateway has run
-          // before; the first message loads the one picked (evicts nothing).
-          const mem = readRemembered();
-          const offer = lastDownloaded
-            .filter((m) => mem[m.id])
-            .map((m) => ({ id: m.id, contextLength: mem[m.id].contextLength, maxContextLength: m.maxContextLength, type: m.type, toolUse: m.toolUse }));
-          const warning = offer.length
-            ? `Nothing is loaded on Frozen right now (LM Studio unloads idle models after an hour). Grok Build loads ${offer.length === 1 ? offer[0].id : "the model you pick"} on your first message — about a minute.`
-            : "Nothing is loaded on Frozen right now, and Grok Build hasn't run a model there yet — load one in LM Studio on Frozen once.";
-          return { ok: true, models: offer, warning };
-        }
+        // Same list original Hermes shows: EVERY chat model downloaded on Frozen,
+        // read live from LM Studio (no hand-written list). Loaded ones first.
+        const loadedIds = new Set(loaded.map((m) => m.id));
+        const rest = lastDownloaded
+          .filter((m) => !loadedIds.has(m.id))
+          .map((m) => ({ id: m.id, contextLength: contextFor(m), maxContextLength: m.maxContextLength, type: m.type, toolUse: m.toolUse, loaded: false }));
+        const models = [...loaded.map((m) => ({ ...m, loaded: true })), ...rest];
         const notes = [];
-        for (const m of loaded) {
-          const a = assessModel(m);
-          if (a.refuse) notes.push(a.refuse);
-          notes.push(...a.warn);
+        if (!loaded.length) {
+          notes.push("Nothing is loaded on Frozen right now (LM Studio unloads idle models after an hour). Your first message loads the model you pick — about a minute.");
+        } else {
+          notes.push(`Loaded now: ${loaded.map((m) => m.id).join(", ")}. Picking a different model asks you to confirm replacing it.`);
+          for (const m of loaded) {
+            const a = assessModel(m);
+            if (a.refuse) notes.push(a.refuse);
+            notes.push(...a.warn);
+          }
         }
-        return { ok: true, models: loaded, warning: notes.length ? notes.join(" ") : null };
+        return { ok: true, models, warning: notes.join(" ") };
       } catch (e) {
         return { ok: false, models: lastLoaded, warning: `Frozen unavailable: ${e.message}` };
       }
@@ -712,10 +858,13 @@ export function createFrozenLocal({ log, dataDir, repoDir, defaultCwd }) {
     },
 
     /**
-     * Can a chat select `model` right now? Same rules a turn applies. Resolves
-     * { ok:true, willLoad } or { ok:false, code, reason }.
+     * Can a chat select `model` right now? Same rules a turn applies.
+     *   { ok:true, willLoad, swapToken? }        — selection accepted
+     *   { ok:false, confirm:{ message } }        — a loaded model would be replaced; ask first
+     *   { ok:false, code, reason }               — refused
+     * `confirmed` is the desktop's re-send after its Confirm dialog.
      */
-    async checkSelectable(model, budgetMs = 6000) {
+    async checkSelectable(model, { confirmed = false, budgetMs = 6000 } = {}) {
       let loaded;
       try {
         loaded = await Promise.race([ensureRoute(), sleep(budgetMs).then(() => { throw fail("TIMEOUT", "Frozen didn't answer in time"); })]);
@@ -723,16 +872,19 @@ export function createFrozenLocal({ log, dataDir, repoDir, defaultCwd }) {
         return { ok: false, code: 4041, reason: `Frozen unavailable: ${e.message}` };
       }
       const plan = planModel(model, { loaded, downloaded: lastDownloaded });
-      const refusal = planRefusal(plan, model);
-      if (refusal) return { ok: false, code: 4041, reason: refusal };
-      if (plan.action === "load" && !isSafeModelId(model)) {
+      if (plan.action === "not-downloaded") return { ok: false, code: 4041, reason: planRefusal(plan, model) };
+      if (plan.action !== "use" && !isSafeModelId(model)) {
         return { ok: false, code: 4041, reason: `${model} has an unusual name, so Grok Build won't load it on Frozen.` };
       }
-      const probe = plan.action === "use"
-        ? plan.model
-        : { ...plan.model, contextLength: chooseLoadContext(plan.model, readRemembered()[model], { override: cfg.loadContext }) };
+      const def = plan.action === "use" ? plan.model : lastDownloaded.find((m) => m.id === model);
+      const probe = plan.action === "use" ? plan.model : { ...def, contextLength: contextFor(def) };
       const verdict = assessModel(probe);
       if (verdict.refuse) return { ok: false, code: 4042, reason: verdict.refuse };
+      if (plan.action === "other-loaded") {
+        const replacing = plan.loaded.map((m) => m.id);
+        if (!confirmed) return { ok: false, confirm: { message: swapConfirmMessage(model, replacing) } };
+        return { ok: true, willLoad: true, swapToken: { to: model, replacing, at: Date.now() } };
+      }
       return { ok: true, willLoad: plan.action === "load" };
     },
 
@@ -758,8 +910,13 @@ export function createFrozenLocal({ log, dataDir, repoDir, defaultCwd }) {
         return { status: "error", note: `⚠️ Frozen Local is unavailable: ${e.message} (No cloud fallback — pick Grok from the model menu to use your subscription instead.)` };
       }
       // Cheap early refusal (no slot needed) when Frozen clearly can't serve this chat.
-      const early = planRefusal(planModel(session.model, { loaded, downloaded: lastDownloaded }), session.model);
-      if (early) return { status: "error", note: `⚠️ ${early}` };
+      {
+        const p0 = planModel(session.model, { loaded, downloaded: lastDownloaded });
+        const swap0 = swapDecision(p0, session.model, session.local_swap_ok);
+        if (p0.action === "not-downloaded" || (p0.action === "other-loaded" && !swap0.allowed)) {
+          return { status: "error", note: `⚠️ ${planRefusal(p0, session.model)}` };
+        }
+      }
 
       // 2) one request at a time across the whole gateway
       const slot = acquireSlot(label);
@@ -777,22 +934,40 @@ export function createFrozenLocal({ log, dataDir, repoDir, defaultCwd }) {
           return { status: "error", note: `⚠️ Frozen Local is unavailable: ${e.message}` };
         }
         const plan = planModel(session.model, { loaded: fresh, downloaded: lastDownloaded });
-        const refusal = planRefusal(plan, session.model);
-        if (refusal) return { status: "error", note: `⚠️ ${refusal}` };
+        if (plan.action === "not-downloaded") return { status: "error", note: `⚠️ ${planRefusal(plan, session.model)}` };
 
         let loadedModel = plan.model;
-        if (plan.action === "load") {
-          const ctx = chooseLoadContext(plan.model, readRemembered()[plan.model.id], { override: cfg.loadContext });
-          const pre = assessModel({ ...plan.model, contextLength: ctx });
+        if (plan.action !== "use") {
+          const def = lastDownloaded.find((m) => m.id === session.model);
+          const ctx = contextFor(def);
+          const pre = assessModel({ ...def, contextLength: ctx });
           if (pre.refuse) return { status: "error", note: `⚠️ ${pre.refuse}` };
-          hooks.onStatus(
-            `Loading \`${plan.model.id}\` on Frozen with ${ctx.toLocaleString("en-US")} context — nothing was loaded ` +
-              `(LM Studio unloads idle models after an hour). This takes about a minute.\n`
-          );
+
+          if (plan.action === "other-loaded") {
+            // A swap needs the token earned in the model menu, and Frozen must
+            // still hold exactly what that confirm was about (Bionic race).
+            const swap = swapDecision(plan, session.model, session.local_swap_ok);
+            if (!swap.allowed) return { status: "error", note: `⚠️ ${planRefusal(plan, session.model)}` };
+            // Never pull a model out from under a running request.
+            const wait = await waitIdle(hooks, `replacing ${swap.replacing.join(", ")}`);
+            if (wait) return wait;
+            hooks.onStatus(`Unloading ${swap.replacing.join(", ")} on Frozen (you confirmed this swap), then loading \`${session.model}\` with ${ctx.toLocaleString("en-US")} context — about a minute.\n`);
+            try {
+              for (const id of swap.replacing) await unloadModel(id);
+            } catch (e) {
+              return { status: "error", note: `⚠️ Couldn't unload on Frozen: ${e.message}. Nothing was sent to the model.` };
+            }
+            delete session.local_swap_ok; // one confirm = one swap
+          } else {
+            hooks.onStatus(
+              `Loading \`${session.model}\` on Frozen with ${ctx.toLocaleString("en-US")} context — nothing was loaded ` +
+                `(LM Studio unloads idle models after an hour). This takes about a minute.\n`
+            );
+          }
           try {
-            loadedModel = await loadModel(plan.model, ctx);
+            loadedModel = await loadModel(def, ctx);
           } catch (e) {
-            return { status: "error", note: `⚠️ Couldn't load \`${plan.model.id}\` on Frozen: ${e.message}. Nothing was sent to the model.` };
+            return { status: "error", note: `⚠️ Couldn't load \`${session.model}\` on Frozen: ${e.message}. Nothing was sent to the model.` };
           }
           busyCache.at = 0;
           if (hooks.isCancelled()) return { status: "interrupted" };
@@ -801,21 +976,9 @@ export function createFrozenLocal({ log, dataDir, repoDir, defaultCwd }) {
         if (assessment.refuse) return { status: "error", note: `⚠️ ${assessment.refuse}` };
 
         // 3) respect Bionic: wait while Frozen's own queue is busy
-        const t0 = Date.now();
-        let announced = false;
-        for (;;) {
-          const b = await busyState(session.model).catch(() => null);
-          if (!b || (b.status === "idle" && b.queued === 0)) break;
-          if (!announced) {
-            hooks.onStatus(`Waiting for Frozen — the model is busy (${b.status}${b.queued ? `, ${b.queued} queued` : ""}), probably Bionic. Your turn starts as soon as it's free.\n`);
-            announced = true;
-          }
-          if (hooks.isCancelled()) return { status: "interrupted" };
-          if (Date.now() - t0 > cfg.busyMaxWaitMs) {
-            return { status: "error", note: `⚠️ Frozen stayed busy for over ${Math.round(cfg.busyMaxWaitMs / 60000)} minutes, so this turn was not sent. Try again when Bionic is done.` };
-          }
-          await sleep(3000);
-          busyCache.at = 0;
+        {
+          const wait = await waitIdle(hooks, "your turn");
+          if (wait) return wait;
         }
 
         // 4) Hermes session (resume the provider's own session id; never Grok's)

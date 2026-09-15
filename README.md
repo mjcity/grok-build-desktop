@@ -329,14 +329,29 @@ server if needed, and never stops it.
 
 Frozen is shared with Bionic, so the rules are strict:
 
-- **Loads only into an empty Frozen.** LM Studio Bionic unloads a model after an
-  hour idle, and restarts come back with nothing loaded. When Frozen has *no* chat
-  model loaded, a local turn loads its chat's model (`lms load … --ttl 3600`, at
-  the context it last ran with, remembered in `frozen-models.json`), shows
-  "Loading … on Frozen", and confirms the load on LM Studio before sending
-  anything. If *any other* model is loaded — probably Bionic's — it refuses and
-  never swaps it out; that decision is re-checked while holding the Frozen slot.
-  The Hermes profile runs `lmstudio_load_mode: jit`, so Hermes never preloads.
+- **Every model Frozen has downloaded is in the menu**, live from LM Studio,
+  the loaded one first — the same list original Hermes shows. Picking the loaded
+  model just uses it.
+- **Loads into an empty Frozen without asking.** LM Studio Bionic unloads a model
+  after an hour idle, and restarts come back with nothing loaded. When Frozen has
+  *no* chat model loaded, a local turn loads its chat's model (`lms load … --ttl
+  3600`), shows "Loading … on Frozen", and confirms the load on LM Studio before
+  sending anything.
+- **Replaces a loaded model only after you confirm.** Picking a model that isn't
+  loaded while another one is — probably Bionic's — pops the desktop's Confirm
+  dialog naming both. Say yes and your *next message* waits for Frozen to go
+  idle, unloads the old model (`lms unload`, verified), loads yours, then runs.
+  One confirm covers one swap: if Bionic's model comes back later, the turn is
+  refused and the menu asks again rather than silently evicting it. The confirm
+  is also re-checked against what's loaded at turn time, so a model Bionic
+  loaded *after* you confirmed is never touched. Two big models are never
+  stacked on the 3090.
+- **Context per model:** `FROZEN_LOAD_CONTEXT` if set, else what that model last
+  ran with (`frozen-models.json`), else the `context_length` original Hermes
+  has for it under `providers.lmstudio.models` in its `config.yaml`
+  (`FROZEN_HERMES_CONFIG`, default `%HERMES_HOME%\config.yaml`), else 64K —
+  always capped at the model's maximum. The Hermes profile runs
+  `lmstudio_load_mode: jit`, so Hermes itself never preloads.
 - **One request at a time**, gateway-wide. If Frozen's own queue is busy, the chat
   shows "waiting for Frozen" instead of stacking requests on Bionic.
 - **Same deny list as Grok.** The `grok-deny-mirror` Hermes plugin
@@ -348,8 +363,9 @@ The Hermes profile lives in `%USERPROFILE%\.grok-hermes-desktop\hermes-local` an
 is rebuilt from `hermes-profile/` on the first local turn. Settings (all optional):
 `FROZEN_SSH_TARGET`, `FROZEN_SSH_KEY`, `FROZEN_LOCAL_PORT`, `FROZEN_REMOTE_PORT`,
 `FROZEN_HERMES_EXE`, `FROZEN_BUSY_MAX_WAIT_MS`, `FROZEN_LOAD_TTL_SECONDS` (3600),
-`FROZEN_LOAD_CONTEXT`, `FROZEN_LOAD_TIMEOUT_MS`, `FROZEN_ABSOLUTE_TIMEOUT_MS`
-(3 h — local turns are slow; Grok keeps its 45 min), and `FROZEN_LOCAL_APPROVALS`
+`FROZEN_LOAD_CONTEXT`, `FROZEN_HERMES_CONFIG`, `FROZEN_LOAD_TIMEOUT_MS`,
+`FROZEN_ABSOLUTE_TIMEOUT_MS` (3 h — local turns are slow; Grok keeps its 45 min),
+and `FROZEN_LOCAL_APPROVALS`
 (`allow`, the default, matches Grok's `--always-approve`; `deny` auto-rejects
 Hermes' dangerous-command prompts).
 
@@ -367,7 +383,8 @@ node scripts\account-relogin-test.mjs   # re-login clears a spent account's mark
 node scripts\frozen-local-unit-test.mjs # Frozen Local pure logic (no network)
 node scripts\frozen-local-e2e.mjs       # Frozen Local live, on a throwaway gateway
 node scripts\frozen-local-swap-e2e.mjs  # a model swap never requests an unloaded model (mock)
-node scripts\frozen-local-load-e2e.mjs  # loads only into an empty Frozen, never over another (mock)
+node scripts\frozen-local-load-e2e.mjs  # loads into an empty Frozen; a loaded one asks first (mock)
+node scripts\frozen-local-replace-e2e.mjs # confirm → unload old, load new; one confirm = one swap (mock)
 <hermes venv>\python.exe scripts\deny-mirror-test.py hermes-profile\plugins\grok-deny-mirror
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\verify-cold-start.ps1
 ```

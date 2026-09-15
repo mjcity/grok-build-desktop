@@ -3136,7 +3136,11 @@ wss.on("connection", (ws) => {
             ok({});
             return;
           }
-          const settleSwitch = () => {
+          const settleSwitch = (swapToken = null) => {
+            // A swap confirm is earned per pick: any switch clears the old one,
+            // and a confirmed pick stores the new one for the next turn.
+            delete target.local_swap_ok;
+            if (swapToken) target.local_swap_ok = swapToken;
             if (activeTurns.has(target.id)) {
               // Mid-turn: queue it and apply at the next turn start. The desktop
               // waits for session.info rather than repainting over the running model.
@@ -3155,13 +3159,20 @@ wss.on("connection", (ws) => {
             emit(target.id, "session.info", sessionInfoPayload(target, false));
           };
           if (provider === LOCAL_SLUG) {
-            // Same rules a turn applies: the loaded model is fine; with NOTHING
-            // loaded a downloaded model is fine (the first message loads it and
-            // evicts nothing); anything else loaded means refuse — never swap
-            // out Bionic's model.
-            frozen.checkSelectable(sw.model).then((v) => {
+            // Same rules a turn applies. Picking a model that isn't loaded while
+            // another is (probably Bionic's) answers `confirm_required`; the
+            // desktop shows its Confirm dialog and re-sends with
+            // `confirm_expensive_model: true`, which earns a one-swap token.
+            const confirmed = params.confirm_expensive_model === true;
+            frozen.checkSelectable(sw.model, { confirmed }).then((v) => {
+              if (!v.ok && v.confirm) {
+                log(`model switch needs confirm session=${target.id.slice(0, 8)} -> ${sw.model}`);
+                ok({ confirm_required: true, confirm_message: v.confirm.message });
+                return;
+              }
               if (!v.ok) return err(v.code, v.reason);
-              settleSwitch();
+              if (v.swapToken) log(`model switch confirmed swap session=${target.id.slice(0, 8)} ${v.swapToken.replacing.join(",")} -> ${sw.model}`);
+              settleSwitch(v.swapToken || null);
             });
             return;
           }

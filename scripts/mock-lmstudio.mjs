@@ -21,6 +21,7 @@ export function startMockLmStudio({ loaded = [], downloaded = [] } = {}) {
   const completions = [];
   const unknown = [];
   const loads = []; // every `lms load` the gateway ran: { at, key, contextLength, ttl, identifier, ok }
+  const unloads = []; // every `lms unload`: { at, id, all, loadedBefore }
   let probes = 0;
 
   /** Emulate the subset of the `lms` CLI the gateway uses. */
@@ -36,6 +37,15 @@ export function startMockLmStudio({ loaded = [], downloaded = [] } = {}) {
       return { code: 0, stdout: JSON.stringify(rows), stderr: "" };
     }
     if (t[1] === "server" && t[2] === "start") return { code: 0, stdout: "Success! Server is now running on port 1234", stderr: "" };
+    if (t[1] === "unload") {
+      const all = t.includes("-a") || t.includes("--all");
+      const id = all ? null : t[2];
+      unloads.push({ at: Date.now(), id, all, loadedBefore: state.loaded.map((m) => m.id) });
+      if (all) { state.loaded = []; return { code: 0, stdout: "Unloaded all models.", stderr: "" }; }
+      if (!state.loaded.some((m) => m.id === id)) return { code: 1, stdout: "", stderr: `Error: No loaded model with identifier "${id}"` };
+      state.loaded = state.loaded.filter((m) => m.id !== id);
+      return { code: 0, stdout: `Model "${id}" unloaded.`, stderr: "" };
+    }
     if (t[1] === "load") {
       const key = t[2];
       const opt = (name) => { const i = t.indexOf(name); return i >= 0 ? t[i + 1] : undefined; };
@@ -164,6 +174,7 @@ export function startMockLmStudio({ loaded = [], downloaded = [] } = {}) {
         completions,
         unknown,
         loads,
+        unloads,
         get probes() { return probes; },
         loadedIds: () => state.loaded.map((m) => m.id),
         setLoaded: (models) => { state.loaded = [...models]; },

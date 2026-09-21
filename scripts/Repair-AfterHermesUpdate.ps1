@@ -25,8 +25,17 @@
 #>
 [CmdletBinding()]
 param(
-  [string] $HermesRepo = "$env:LOCALAPPDATA\hermes\hermes-agent",
+  # Grok Build's OWN clone of upstream Hermes (since 2026-09-21). It used to be
+  # built out of stock Hermes's install checkout, which meant every stock
+  # self-update wiped our patches or deleted the build, and every rebuild here
+  # had to kill the user's running Hermes to rewrite release\win-unpacked.
+  # Separate tree = stock Hermes is never read, written, or stopped by us.
+  [string] $HermesRepo = 'D:\Program\grok\projects\hermes-src-grokbuild',
   [string] $GrokAppDir = "$env:LOCALAPPDATA\GrokBuildDesktop\app",
+  # Pull upstream's tip into OUR tree first (shallow; upstream squashes history,
+  # so this is a reset, never a merge). Without it the script rebuilds what is
+  # already checked out.
+  [switch] $Update,
   [switch] $SkipInstall
 )
 
@@ -45,11 +54,45 @@ function Invoke-Native {
   param([string] $What, [scriptblock] $Command)
   $prev = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
-  try { & $Command 2>&1 | Out-Null } finally { $ErrorActionPreference = $prev }
-  if ($LASTEXITCODE -ne 0) { Fail "$What failed (exit $LASTEXITCODE)" }
+  $out = $null
+  try { $out = & $Command 2>&1 } finally { $ErrorActionPreference = $prev }
+  if ($LASTEXITCODE -ne 0) {
+    # Show WHY. This used to discard the output, so a build that failed on a
+    # single missing export reported only "exit 1" and had to be re-run by hand
+    # to learn anything (2026-09-21).
+    $code = $LASTEXITCODE
+    Write-Host "  ---- last lines of '$What' ----" -ForegroundColor Yellow
+    $ansi = [regex]::Escape([string][char]27) + '\[[0-9;]*m'   # PS 5.1 has no `e escape
+    ($out | ForEach-Object { "$_" -replace $ansi, '' } | Where-Object { $_.Trim() } | Select-Object -Last 25) |
+      ForEach-Object { Write-Host "  $_" }
+    Fail "$What failed (exit $code)"
+  }
 }
 
 if (-not (Test-Path $desktop)) { Fail "Hermes repo not found at $HermesRepo" }
+
+if ($Update) {
+  Step "Pull upstream tip into OUR tree"
+  # Upstream squashes main to a single root commit on every push, so there is
+  # nothing to merge: fetch the tip shallow and reset to it. The only local
+  # modifications this tree ever carries are the files in patches\*.patch,
+  # which the next step re-applies - so the hard reset loses nothing. This is
+  # safe ONLY because the tree is ours; never point -HermesRepo at stock
+  # Hermes's install.
+  if ($HermesRepo -like "*\AppData\Local\hermes\*") {
+    Fail "-Update refuses to reset stock Hermes's own checkout ($HermesRepo). Use Grok Build's clone."
+  }
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    & git -C $HermesRepo fetch --depth 1 origin main 2>&1 | Out-Null
+    $fetched = ($LASTEXITCODE -eq 0)
+    if ($fetched) { & git -C $HermesRepo reset --hard FETCH_HEAD 2>&1 | Out-Null }
+    $reset = ($LASTEXITCODE -eq 0)
+  } finally { $ErrorActionPreference = $prev }
+  if (-not $fetched) { Fail 'git fetch from upstream failed (network?)' }
+  if (-not $reset) { Fail 'git reset to the fetched tip failed' }
+}
 
 Step "Hermes commit"
 $sha = (& git -C $HermesRepo rev-parse --short HEAD).Trim()
@@ -61,8 +104,15 @@ Step "Backend contract drift"
 $contract = (Select-String -Path (Join-Path $HermesRepo 'tui_gateway\server.py') `
   -Pattern '^DESKTOP_BACKEND_CONTRACT\s*=\s*(\d+)').Matches[0].Groups[1].Value
 Write-Host "  upstream contract: $contract"
-if ($contract -ne '6') {
-  Fail "contract moved to $contract (gateway claims 6). Update the gateway before rebuilding - see docs\HERMES-UPDATE-PROTOCOL.md"
+# Compare against what the gateway ACTUALLY claims, read from its source. A
+# hardcoded number here is a second copy that goes stale the moment the gateway
+# is (correctly) bumped - the gate would then block a legitimate build, or
+# worse, get "fixed" by editing the gate instead of the gateway.
+$claimed = (Select-String -Path (Join-Path $gateway 'server.mjs') `
+  -Pattern '^\s*desktop_contract:\s*(\d+),').Matches[0].Groups[1].Value
+Write-Host "  gateway claims:    $claimed"
+if ($contract -ne $claimed) {
+  Fail "contract is $contract upstream but the gateway claims $claimed. Work out what v$contract requires and update the gateway honestly before rebuilding - see docs\HERMES-UPDATE-PROTOCOL.md"
 }
 
 Step "Re-apply local patches"
@@ -105,7 +155,10 @@ Push-Location $desktop
 try { Invoke-Native 'npm run build' { npm run build } } finally { Pop-Location }
 
 Step "Package (release\win-unpacked)"
-Stop-Process -Name Hermes, GrokBuild -Force -ErrorAction SilentlyContinue
+# GrokBuild ONLY. Stock Hermes runs from its own install and is none of our
+# business any more - this line used to kill it too, because both apps shared
+# one release folder.
+Stop-Process -Name GrokBuild -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 2
 Push-Location $desktop
 try { Invoke-Native 'npm run builder' { npm run builder -- --dir } } finally { Pop-Location }
@@ -127,9 +180,12 @@ Step "Verify patches reached the INSTALLED bundle"
 $assets = Join-Path $GrokAppDir 'resources\app.asar.unpacked\dist\assets'
 $link = Get-ChildItem "$assets\external-link*.js" -ErrorAction SilentlyContinue
 if (-not $link) { Fail "no external-link chunk under $assets" }
-$hits = (Select-String -Path $link.FullName -Pattern 'inApp' -AllMatches |
+# Marker = the data-link-routing="system-first" attribute the patch puts on link
+# anchors. It is a string literal, so it survives minification; the patch's
+# actual logic (an inverted helper) leaves nothing greppable behind.
+$hits = (Select-String -Path $link.FullName -Pattern 'system-first' -AllMatches |
          ForEach-Object { $_.Matches.Count } | Measure-Object -Sum).Sum
-Write-Host "  $($link.Name): inApp x$hits"
+Write-Host "  $($link.Name): system-first x$hits"
 if (-not $hits) { Fail 'link patch is NOT in the installed bundle' }
 
 # Taskbar identity - verify the INSTALLED main bundle, independently of

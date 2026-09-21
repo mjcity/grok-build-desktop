@@ -1,5 +1,5 @@
 diff --git a/apps/desktop/src/app/right-sidebar/terminal/links.test.ts b/apps/desktop/src/app/right-sidebar/terminal/links.test.ts
-index 76b5e4b9c..88818cce4 100644
+index 76b5e4b..88818cc 100644
 --- a/apps/desktop/src/app/right-sidebar/terminal/links.test.ts
 +++ b/apps/desktop/src/app/right-sidebar/terminal/links.test.ts
 @@ -43,23 +43,24 @@ async function clickLinkIn(text: string, event: MouseEvent) {
@@ -44,7 +44,7 @@ index 76b5e4b9c..88818cce4 100644
  })
  
 diff --git a/apps/desktop/src/app/right-sidebar/terminal/links.ts b/apps/desktop/src/app/right-sidebar/terminal/links.ts
-index cba690fd5..926bbd388 100644
+index cba690f..9f6dcef 100644
 --- a/apps/desktop/src/app/right-sidebar/terminal/links.ts
 +++ b/apps/desktop/src/app/right-sidebar/terminal/links.ts
 @@ -25,13 +25,13 @@ export function isTerminalLinkActivation(
@@ -56,18 +56,18 @@ index cba690fd5..926bbd388 100644
 -// ⇧⌘ to escape, which keeps both gestures reachable without stealing the
 -// selection back from a plain click.
 +// second chord left to mean "the other browser" — ⇧ takes that job here.
-+// Elsewhere a bare click opens the system browser and ⌘ opens the in-app pane;
-+// here it's ⌘ to open and ⇧⌘ for the pane, which keeps both gestures reachable
++// GROK BUILD PATCH: ⌘-click opens the system browser and ⇧⌘ opens the in-app
++// pane (upstream ships these two swapped), which keeps both gestures reachable
 +// without stealing the selection back from a plain click.
  const activate = (event: MouseEvent, uri: string) => {
    if (isTerminalLinkActivation(event)) {
 -    openLink(uri, { native: event.shiftKey })
-+    openLink(uri, { inApp: event.shiftKey })
++    openLink(uri, { native: !event.shiftKey })
    }
  }
  
 diff --git a/apps/desktop/src/lib/external-link.test.tsx b/apps/desktop/src/lib/external-link.test.tsx
-index 4b4eb25e1..719d30474 100644
+index 4b4eb25..719d304 100644
 --- a/apps/desktop/src/lib/external-link.test.tsx
 +++ b/apps/desktop/src/lib/external-link.test.tsx
 @@ -108,9 +108,9 @@ describe('external link helpers', () => {
@@ -112,58 +112,58 @@ index 4b4eb25e1..719d30474 100644
  
    it('treats only the HUD renderer as a native-link surface', () => {
 diff --git a/apps/desktop/src/lib/external-link.tsx b/apps/desktop/src/lib/external-link.tsx
-index f4bd0aa53..b932f8b68 100644
+index 4635323..3fc9e88 100644
 --- a/apps/desktop/src/lib/external-link.tsx
 +++ b/apps/desktop/src/lib/external-link.tsx
-@@ -207,7 +207,13 @@ export function openExternalLink(href: string): void {
-  * the modifier every app uses for "open this somewhere else". Middle-click
-  * counts too: it is the other half of the same convention.
-  */
--export function wantsNativeBrowser(event: Pick<MouseEvent, 'button' | 'ctrlKey' | 'metaKey'>): boolean {
-+// GROK BUILD PATCH (patches/0001-links-open-in-system-browser.patch). Upstream
-+// sends a bare click to the in-app pane and puts the system browser behind
-+// ⌘/Ctrl. We swap the two: a bare click goes where the user's logins,
-+// extensions and tabs already are; the pane is kept, demoted to the modifier.
-+// True when a click asked for the IN-APP browser — ⌘ on macOS, Ctrl elsewhere,
-+// or middle-click, the "open this somewhere else" convention.
-+export function wantsInAppBrowser(event: Pick<MouseEvent, 'button' | 'ctrlKey' | 'metaKey'>): boolean {
-   return event.button === 1 || (IS_MAC ? event.metaKey : event.ctrlKey)
+@@ -213,12 +213,24 @@ export function openExternalLink(href: string): void {
  }
  
-@@ -236,14 +242,16 @@ export function hudForcesNativeLinks(search = typeof window === 'undefined' ? ''
-  * no business in the webview and always hands off to the OS. The HUD has no
-  * browser pane, so it always takes the OS path.
+ /**
+- * True when a click asked for the SYSTEM browser — ⌘ on macOS, Ctrl elsewhere,
+- * the modifier every app uses for "open this somewhere else". Middle-click
+- * counts too: it is the other half of the same convention.
++ * True when a click asked for the SYSTEM browser.
++ *
++ * GROK BUILD PATCH (patches/0001-links-open-in-system-browser.patch). Upstream
++ * answers "the ⌘/Ctrl modifier or a middle-click" — a bare click goes to the
++ * in-app pane and the modifier escapes to the OS. Grok Build swaps the roles: a
++ * BARE click wants the system browser (where the user's logins, extensions and
++ * tabs already are) and the modifier asks for the pane instead.
++ *
++ * The swap lives HERE, in the helper's meaning, not in the call sites: every
++ * caller written as `openLink(x, { native: wantsNativeBrowser(e) })` — including
++ * ones upstream adds later — inherits the routing without being patched. (An
++ * earlier version renamed the helper and the option; the first new upstream
++ * caller broke the build.)
   */
--export function openLink(href: string, options: { native?: boolean } = {}): void {
-+export function openLink(href: string, options: { inApp?: boolean } = {}): void {
-   const target = normalizeExternalUrl(href)
+ export function wantsNativeBrowser(event: Pick<MouseEvent, 'button' | 'ctrlKey' | 'metaKey'>): boolean {
+-  return event.button === 1 || (IS_MAC ? event.metaKey : event.ctrlKey)
++  const askedForTheOtherSurface = event.button === 1 || (IS_MAC ? event.metaKey : event.ctrlKey)
++
++  return !askedForTheOtherSurface
+ }
  
-   if (!target) {
+ /**
+@@ -253,8 +265,10 @@ export function openLink(href: string, options: { native?: boolean } = {}): void
      return
    }
  
--  if (options.native || hudForcesNativeLinks() || !/^https?:$/i.test(parseUrl(target)?.protocol ?? '')) {
-+  // System browser unless the caller explicitly asked for the pane (`inApp`).
-+  // HUD surfaces and non-web schemes always hand off to the OS, as upstream.
-+  if (!options.inApp || hudForcesNativeLinks() || !/^https?:$/i.test(parseUrl(target)?.protocol ?? '')) {
-     openExternalLink(target)
- 
-     return
-@@ -314,7 +322,7 @@ export function ExternalLink({
- 
-         event.preventDefault()
-         event.stopPropagation()
--        openExternalLink(target)
-+        openLink(target, { inApp: !native })
-       }}
-       onClick={event => {
-         event.stopPropagation()
-@@ -325,7 +333,7 @@ export function ExternalLink({
-         }
- 
-         event.preventDefault()
--        openLink(target, { native: native || wantsNativeBrowser(event.nativeEvent) })
-+        openLink(target, { inApp: !native && wantsInAppBrowser(event.nativeEvent) })
-       }}
-       rel="noopener noreferrer"
-       target="_blank"
++  // GROK BUILD PATCH: no opinion from the caller means the system browser
++  // (upstream defaults a bare `openLink(href)` to the in-app pane).
+   if (
+-    options.native ||
++    (options.native ?? true) ||
+     isConnectorAuthorizationLink(target) ||
+     hudForcesNativeLinks() ||
+     !/^https?:$/i.test(parseUrl(target)?.protocol ?? '')
+@@ -319,6 +333,10 @@ export function ExternalLink({
+   return (
+     <a
+       className={cn('ref', className)}
++      // GROK BUILD PATCH marker. A string literal survives minification, so the
++      // repair script can prove this patch reached the INSTALLED bundle, and the
++      // routing is checkable on a live link in devtools.
++      data-link-routing="system-first"
+       href={target}
+       // Middle-click never fires `click`; it's the other half of the
+       // open-elsewhere convention, so it has to be caught on its own.

@@ -124,8 +124,8 @@ remote backend — a mechanism Hermes supports out of the box
 (`HERMES_DESKTOP_REMOTE_URL`). We didn't fork or patch Hermes; we speak its
 language.
 
-> **Tested against:** Hermes commit `b2aa855b` (2026-09-08), desktop backend
-> contract **6**. Updating the Hermes install? Follow
+> **Tested against:** Hermes commit `7b3c7ae` (2026-09-21), desktop backend
+> contract **7**. Updating the Hermes install? Follow
 > [docs/HERMES-UPDATE-PROTOCOL.md](docs/HERMES-UPDATE-PROTOCOL.md) — it is
 > mandatory, backup-first, and exit-code-gated.
 

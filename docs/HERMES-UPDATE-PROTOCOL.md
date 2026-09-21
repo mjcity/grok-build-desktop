@@ -12,6 +12,39 @@ Machine facts (this install):
 - Our gateway repo: `D:\Program\grok\projects\hermes-agent-fork\grok-gateway`
 - Gateway logs: `%USERPROFILE%\.grok-hermes-desktop\logs\`
 
+## READ FIRST (2026-09-21): Grok Build has its OWN Hermes source tree
+
+Grok Build is no longer built out of stock Hermes's install checkout
+(`%LOCALAPPDATA%\hermes\hermes-agent`). It has its own shallow clone of upstream:
+
+    D:\Program\grok\projects\hermes-src-grokbuild
+
+Why: sharing one checkout meant every stock self-update wiped our patches or
+deleted `release\`, and every rebuild here had to KILL the user's running Hermes
+to rewrite `release\win-unpacked`. With a separate tree, stock Hermes is never
+read, written, or stopped by anything in this repo. **Do not point any script
+here at the stock install again** - `-Update` refuses to.
+
+The whole update is now one command:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\Repair-AfterHermesUpdate.ps1 -Update
+```
+
+`-Update` fetches upstream's tip (shallow - upstream squashes to one commit, so
+it is a reset, never a merge), re-applies `patches\*.patch`, runs `npm install`,
+builds, packages into the tree's own `release\`, refreshes the Grok-branded copy,
+and verifies link patch + AppUserModelID + window icon on the INSTALLED copy. It
+stops with an explanation if upstream's `DESKTOP_BACKEND_CONTRACT` differs from
+the `desktop_contract` the gateway claims (read from `server.mjs`, not
+hardcoded) - that is a "work out what the new version requires" moment, not a
+number to bump. Sections below that talk about stashing/branching inside the
+stock checkout are historical.
+
+Contract history note: **v7** (2026-09) turned blocking prompts into JSON-RPC
+server->client requests. This gateway emits no blocking prompts at all, so v7 is
+satisfied truthfully with `open_requests: []` on `session.resume`.
+
 ## 0. Preconditions (hard stop if any fails)
 
 1. **No active work.** `GET http://127.0.0.1:8787/api/status` →
@@ -89,8 +122,8 @@ the patch survived.
 | `acp_adapter/session.py` | Buzz ACP compatibility — **needs rework**, see below | `patches/0002-buzz-acp-compat.patch.needs-rework` |
 | `tools/environments/local.py` | Buzz ACP compatibility | `patches/0002-buzz-acp-compat.patch` |
 | `tools/tool_search.py` | Buzz ACP compatibility — **needs rework** | `_NEVER_DEFER_TOOL_NAMES` |
-| `apps/desktop/src/lib/external-link.tsx` | A bare click on a chat link opens the **system** browser; the in-app preview pane moves to ⌘/Ctrl-click and middle-click. Upstream shipped these swapped in `d07be6e1`. | `wantsInAppBrowser` |
-| `apps/desktop/src/app/right-sidebar/terminal/links.ts` | Same swap for terminal links: ⌘/Ctrl-click → system browser, ⇧⌘ → in-app pane. | `inApp: event.shiftKey` |
+| `apps/desktop/src/lib/external-link.tsx` | A bare click on a chat link opens the **system** browser; the in-app preview pane moves to ⌘/Ctrl-click and middle-click. Upstream shipped these swapped in `d07be6e1`. | `system-first` (data attribute on link anchors) |
+| `apps/desktop/src/app/right-sidebar/terminal/links.ts` | Same swap for terminal links: ⌘/Ctrl-click → system browser, ⇧⌘ → in-app pane. | `native: !event.shiftKey` |
 
 > **Buzz patches parked at `13f4cfeb` (2026-08-22).** All three conflict with
 > upstream's rewrite of those files, and none of the changes were adopted

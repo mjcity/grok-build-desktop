@@ -180,12 +180,50 @@ const ACCOUNT_RETRY_AFTER_MS = Number(
     process.env.GROK_ACCOUNT_RESET_WINDOW_MS ||
     20 * 60 * 1000
 );
-const ALL_EXHAUSTED_NOTE =
+const ALL_EXHAUSTED_BASE =
   "⚠️ All linked Grok accounts are out of weekly Grok Build balance. " +
   "Each account's balance resets weekly on its own schedule; just send the " +
   "message again once one has reset — the gateway re-checks every account " +
   "automatically and needs no restart. To add more fallback capacity, log in " +
   "another account (GROK_HOME=~/.grok-c grok login).";
+
+/** Every account home this gateway is configured to use, signed in or not. */
+function configuredHomes() {
+  // Priority order. Env override: GROK_ACCOUNT_HOMES = "C:\a;C:\b".
+  const raw = String(process.env.GROK_ACCOUNT_HOMES || "").trim();
+  return raw
+    ? raw.split(path.delimiter).filter(Boolean)
+    : [path.join(os.homedir(), ".grok"), path.join(os.homedir(), ".grok-b")];
+}
+
+/** Configured homes with no auth.json - i.e. signed out, unusable as fallback. */
+function signedOutHomes() {
+  return configuredHomes().filter((home) => {
+    try {
+      return !fs.existsSync(path.join(home, "auth.json"));
+    } catch {
+      return true;
+    }
+  });
+}
+
+// A signed-out account used to vanish without a trace: loadAccounts() skips a
+// home that has no auth.json (correct - spawning grok there is doomed), but it
+// did so SILENTLY. On 2026-09-21 ~/.grok-b had been signed out for an unknown
+// stretch and the gateway had quietly been running single-account the whole
+// time; the first the user would have heard of it was this "all accounts out
+// of balance" message, which would also have been wrong about the cause. Say
+// what is actually true, with the command that fixes it.
+function allExhaustedNote() {
+  const out = signedOutHomes();
+  if (!out.length) return ALL_EXHAUSTED_BASE;
+  return (
+    ALL_EXHAUSTED_BASE +
+    `\n\nHeads-up: ${out.length === 1 ? "one configured account is" : `${out.length} configured accounts are`} ` +
+    `signed out, so ${out.length === 1 ? "it" : "they"} could not be used as fallback: ${out.join(", ")}. ` +
+    `Sign in from a terminal with:  set GROK_HOME=<that folder>  then  grok login --device-auth`
+  );
+}
 /** { homePath: epochMs } — in-memory only; cleared on gateway restart. */
 const exhaustedAt = new Map();
 
@@ -212,11 +250,7 @@ function markAccountWorked(home) {
 }
 
 function loadAccounts() {
-  // Priority order. Env override: GROK_ACCOUNT_HOMES = "C:\a;C:\b".
-  const raw = String(process.env.GROK_ACCOUNT_HOMES || "").trim();
-  const homes = raw
-    ? raw.split(path.delimiter).filter(Boolean)
-    : [path.join(os.homedir(), ".grok"), path.join(os.homedir(), ".grok-b")];
+  const homes = configuredHomes();
   // Only homes that are actually LOGGED IN (auth.json present) can serve a
   // turn — a home without it isn't usable fallback, so skip it silently
   // rather than spawn a doomed grok on it.
@@ -1035,7 +1069,18 @@ function sessionInfoPayload(s, running) {
     // rows there are no keyless rows to mis-render, which is the only thing
     // v6 guards. v2/v3/v5 concern file.attach + approvals RPCs we likewise
     // don't serve; v4's session-creation shape we already honor.
-    desktop_contract: 6,
+    //   v7 (upstream 2026-09) blocking prompts became JSON-RPC server->client
+    //   REQUESTS (`srq-<n>` frames, replayed via session.resume `open_requests`)
+    //   instead of `<kind>.request` notifications, which the v7 renderer no
+    //   longer listens for.
+    // v7 is honestly satisfied, not just claimed: this gateway has never
+    // emitted a blocking prompt of any kind (grep `.request"` - none). Grok
+    // runs with permission_mode always-approve, and Frozen Local answers ACP
+    // permission requests in-process (choosePermission) without involving the
+    // desktop. So there is no notification to convert; session.resume reports
+    // the truthful empty `open_requests: []`. If a blocking prompt is ever
+    // added here it MUST be a server->client request, never a notification.
+    desktop_contract: 7,
     // Added upstream 2026-08 (arrived under contract 5 — additive, renderer type-guards
     // it). NOT cosmetic: the desktop keys attachment handling off this. Any of
     // CONTAINER_TERMINAL_BACKENDS (docker/ssh/singularity/modal/daytona/
@@ -1067,6 +1112,89 @@ function sessionInfoPayload(s, running) {
 }
 
 /** WS display messages (_history_to_messages: role + text). */
+// ── Reasoning budget ─────────────────────────────────────────────────────────
+// Local "thinking" models (Qwen-class, via Frozen Local) emit chain-of-thought
+// by the hundred kilobytes: measured 2026-09-21, one reply carried 176 KB of
+// reasoning and a 34-message chat held 459 KB of it against 42 KB of actual
+// answers. Forwarded chunk by chunk, the desktop re-renders an ever-growing
+// string on every delta (quadratic work), and on chat open it hydrates every
+// stored blob - that is what made the timeline sluggish after the LM Studio
+// wiring. Grok's own reasoning tops out around 18 KB per reply, which is why
+// the Grok path never showed it.
+//
+// Nobody reads 176 KB of raw thoughts, so budget it instead of shipping it:
+//   - live: forward up to REASONING_LIVE_CAP chars per turn, then one note;
+//   - stored / re-served: keep the head and the tail, mark what was dropped.
+// The answer text is never touched, and the stall watchdog is still fed by
+// every chunk (touchActivity is called by the callers, not from here).
+const REASONING_LIVE_CAP = Number(process.env.GROK_REASONING_LIVE_CAP || 24 * 1024);
+const REASONING_KEEP_HEAD = Number(process.env.GROK_REASONING_KEEP_HEAD || 4 * 1024);
+const REASONING_KEEP_TAIL = Number(process.env.GROK_REASONING_KEEP_TAIL || 12 * 1024);
+const REASONING_HIDDEN_NOTE =
+  "\n\n[… still thinking — the rest of this reasoning is hidden to keep the chat responsive …]";
+
+function reasoningTrimMarker(droppedChars) {
+  return `\n\n[… ${Math.max(1, Math.round(droppedChars / 1024))} KB of reasoning trimmed …]\n\n`;
+}
+
+/** Head + tail of an already-complete reasoning string. Small ones pass through. */
+function trimReasoning(text) {
+  if (typeof text !== "string" || !text) return null;
+  if (text.length <= REASONING_KEEP_HEAD + REASONING_KEEP_TAIL) return text;
+  const dropped = text.length - REASONING_KEEP_HEAD - REASONING_KEEP_TAIL;
+  return (
+    text.slice(0, REASONING_KEEP_HEAD) +
+    reasoningTrimMarker(dropped) +
+    text.slice(-REASONING_KEEP_TAIL)
+  );
+}
+
+/** Per-turn accumulator: bounded memory, bounded live forwarding. */
+function createReasoningSink() {
+  let head = "";
+  let tail = "";
+  let total = 0;
+  let forwarded = 0;
+  let noted = false;
+  return {
+    /** Record a chunk for the stored transcript (head + rolling tail only). */
+    account(t) {
+      if (typeof t !== "string" || !t) return;
+      total += t.length;
+      let rest = t;
+      if (head.length < REASONING_KEEP_HEAD) {
+        const take = rest.slice(0, REASONING_KEEP_HEAD - head.length);
+        head += take;
+        rest = rest.slice(take.length);
+      }
+      if (rest) tail = (tail + rest).slice(-REASONING_KEEP_TAIL);
+    },
+    /** The part of this chunk that may still be forwarded live, or null. */
+    live(t) {
+      if (typeof t !== "string" || !t) return null;
+      if (forwarded >= REASONING_LIVE_CAP) {
+        if (noted) return null;
+        noted = true;
+        return REASONING_HIDDEN_NOTE;
+      }
+      const part = t.slice(0, REASONING_LIVE_CAP - forwarded);
+      forwarded += part.length;
+      if (forwarded >= REASONING_LIVE_CAP) {
+        noted = true;
+        return part + REASONING_HIDDEN_NOTE;
+      }
+      return part;
+    },
+    get total() {
+      return total;
+    },
+    text() {
+      const dropped = total - head.length - tail.length;
+      return dropped > 0 ? head + reasoningTrimMarker(dropped) + tail : head + tail;
+    },
+  };
+}
+
 function displayMessages(s) {
   return (s.messages || []).map((m) => ({
     role: m.role,
@@ -1089,7 +1217,9 @@ function restMessages(s) {
     timestamp: m.timestamp,
     token_count: null,
     finish_reason: null,
-    reasoning: m.reasoning ?? null,
+    // Trimmed at READ time, so chats bloated before the reasoning budget
+    // existed get fast again without rewriting sessions.json.
+    reasoning: trimReasoning(m.reasoning),
     reasoning_content: null,
     reasoning_details: null,
     codex_reasoning_items: null,
@@ -1480,12 +1610,12 @@ function runGrokTurn(
     if (!silent) {
       emit(session.id, "session.info", sessionInfoPayload(session, true));
       emit(session.id, "message.start");
-      emit(session.id, "message.delta", { text: ALL_EXHAUSTED_NOTE });
-      session.messages.push({ role: "assistant", content: ALL_EXHAUSTED_NOTE, timestamp: nowSec() });
+      emit(session.id, "message.delta", { text: allExhaustedNote() });
+      session.messages.push({ role: "assistant", content: allExhaustedNote(), timestamp: nowSec() });
       session.updated_at = nowSec();
       upsertSession(session);
       emit(session.id, "message.complete", {
-        text: ALL_EXHAUSTED_NOTE,
+        text: allExhaustedNote(),
         usage: sessionUsage(session),
         status: "error",
       });
@@ -1526,7 +1656,7 @@ function runGrokTurn(
 
   let buffer = "";
   let full = "";
-  let reasoning = "";
+  const reasoningSink = createReasoningSink();
   let cancelled = false; // user pressed Stop (session.interrupt)
   let autoKillReason = null; // "stall" | "absolute" — our watchdog fired, not the user
   let sawExhaustion = false; // grok reported 402/usage-balance-exhausted — trigger account fallback
@@ -1667,9 +1797,12 @@ function runGrokTurn(
         // reasoning.delta lane (renders in the reasoning disclosure).
         // thinking.delta would be WRONG: that lane is the kawaii spinner
         // status and the desktop hard-ignores it (gateway-event.ts:263-267).
-        reasoning += ev.data;
+        reasoningSink.account(ev.data);
         touchActivity(session.id);
-        if (!silent) emit(session.id, "reasoning.delta", { text: ev.data });
+        if (!silent) {
+          const liveText = reasoningSink.live(ev.data);
+          if (liveText) emit(session.id, "reasoning.delta", { text: liveText });
+        }
       } else if (ev.type === "end") {
         const sid = ev.sessionId || ev.session_id;
         if (sid) {
@@ -1736,8 +1869,8 @@ function runGrokTurn(
       // No usable account left (or a silent turn): settle cleanly. For a
       // visible turn, say so plainly instead of leaving an empty bubble.
       if (!silent) {
-        full = ALL_EXHAUSTED_NOTE;
-        emit(session.id, "message.delta", { text: ALL_EXHAUSTED_NOTE });
+        full = allExhaustedNote();
+        emit(session.id, "message.delta", { text: allExhaustedNote() });
       }
       finish(full, "error");
       return;
@@ -1813,7 +1946,7 @@ function runGrokTurn(
       if (!silent) emit(session.id, "message.delta", { text: full });
     }
     log(
-      `turn end session=${session.id.slice(0, 8)} status=${status} chars=${full.length} reasoning=${reasoning.length}${silent ? " (silent/reflection)" : ""}`
+      `turn end session=${session.id.slice(0, 8)} status=${status} chars=${full.length} reasoning=${reasoningSink.total}${silent ? " (silent/reflection)" : ""}`
     );
     finish(full, status);
   });
@@ -1857,7 +1990,7 @@ function runGrokTurn(
         session.messages.push({
           role: "assistant",
           content: content || "",
-          reasoning: reasoning || null,
+          reasoning: reasoningSink.text() || null,
           timestamp: nowSec(),
         });
         if (!session.title && text) {
@@ -1875,7 +2008,7 @@ function runGrokTurn(
         text: content || "",
         usage: sessionUsage(session),
         status,
-        reasoning: reasoning || null,
+        reasoning: reasoningSink.text() || null,
       });
       emit(session.id, "session.info", sessionInfoPayload(session, false));
       emit(session.id, "session.title", {
@@ -1997,7 +2130,7 @@ function submitPrompt(session, text) {
  */
 function runLocalTurn(session, text) {
   let full = "";
-  let reasoning = "";
+  const reasoningSink = createReasoningSink();
   let cancelled = false;
   let autoKillReason = null;
   let finished = false;
@@ -2042,17 +2175,26 @@ function runLocalTurn(session, text) {
     .runTurn(session, text, {
       onEvent: (type, payload) => {
         touchActivity(sid);
+        // Thought chunks arrive here as reasoning.delta (and separately via
+        // onReasoning for the transcript). This is the lane that carried 176 KB
+        // for one reply - forward only what the reasoning budget allows.
+        if (type === "reasoning.delta") {
+          const liveText = reasoningSink.live(payload && payload.text);
+          if (liveText) emit(sid, type, { ...payload, text: liveText });
+          return;
+        }
         emit(sid, type, payload);
       },
       onText: (t) => {
         full += t;
       },
       onReasoning: (t) => {
-        reasoning += t;
+        reasoningSink.account(t);
       },
       onStatus: (t) => {
+        // Short status lines ("waiting for Frozen...") - always shown.
         touchActivity(sid);
-        reasoning += t;
+        reasoningSink.account(t);
         emit(sid, "reasoning.delta", { text: t });
       },
       isCancelled: () => cancelled,
@@ -2086,7 +2228,7 @@ function runLocalTurn(session, text) {
       full = EMPTY_TURN_NOTE;
       log(`empty visible turn session=${sid.slice(0, 8)} status=${status} — substituted stop note`);
     }
-    log(`turn end session=${sid.slice(0, 8)} provider=${LOCAL_SLUG} status=${status} chars=${full.length} reasoning=${reasoning.length}`);
+    log(`turn end session=${sid.slice(0, 8)} provider=${LOCAL_SLUG} status=${status} chars=${full.length} reasoning=${reasoningSink.total}`);
 
     clearTurnKeepalive(sid);
     activeTurns.delete(sid);
@@ -2095,7 +2237,7 @@ function runLocalTurn(session, text) {
       session.messages.push({
         role: "assistant",
         content: full,
-        reasoning: reasoning || null,
+        reasoning: reasoningSink.text() || null,
         timestamp: nowSec(),
       });
       if (!session.title && text) session.title = String(text).trim().slice(0, 56);
@@ -2109,7 +2251,7 @@ function runLocalTurn(session, text) {
       text: full,
       usage: sessionUsage(session),
       status,
-      reasoning: reasoning || null,
+      reasoning: reasoningSink.text() || null,
     });
     emit(sid, "session.info", sessionInfoPayload(session, false));
     emit(sid, "session.title", { session_id: sid, title: session.title || "" });
@@ -2896,6 +3038,10 @@ wss.on("connection", (ws) => {
             messages: displayMessages(session),
             info: sessionInfoPayload(session, running),
             inflight: null,
+            // Contract v7: still-open server->client requests to re-deliver
+            // after a reconnect. Truthfully empty - this gateway never opens
+            // one (see the desktop_contract note in sessionInfoPayload).
+            open_requests: [],
             running,
             session_key: session.id,
             started_at: session.created_at,
@@ -3412,6 +3558,17 @@ wsKeepalive.unref?.();
 
 server.listen(PORT, HOST, () => {
   log(`grok-gateway v2 listening on http://${HOST}:${PORT}`);
+  // Say the account roster out loud at every start. A signed-out fallback
+  // account is invisible at runtime (it is simply never picked), so this line
+  // is where "you are running on ONE account" gets noticed.
+  {
+    const usable = loadAccounts().map((a) => a.home);
+    const out = signedOutHomes();
+    log(
+      `accounts: ${usable.length} signed in [${usable.join(", ") || "none"}]` +
+        (out.length ? ` - SIGNED OUT, unusable as fallback: [${out.join(", ")}]` : "")
+    );
+  }
   log(`grok binary: ${findGrok()}`);
   log(`data dir:    ${DATA}`);
   log(`default cwd: ${DEFAULT_CWD}`);

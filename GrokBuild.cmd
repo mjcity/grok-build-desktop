@@ -39,8 +39,13 @@ set "GW_URL=http://127.0.0.1:%GROK_BUILD_PORT%"
 rem The gateway lives next to this script - no install path to configure.
 set "GATEWAY_DIR=%~dp0"
 
-rem Hermes desktop install: env override, then common locations.
+rem Hermes desktop build to brand: env override, then Grok Build's OWN Hermes
+rem tree, then - only as a fallback for a machine that has no such tree - a
+rem stock Hermes install. Our tree must win: the branding step below re-copies
+rem from HERMES_DIR whenever its stamp differs, so preferring stock here made
+rem every launch overwrite our patched build with stock's unpatched one.
 set "HERMES_DIR=%GROK_BUILD_HERMES_DIR%"
+if not defined HERMES_DIR if exist "%GATEWAY_DIR%..\..\hermes-src-grokbuild\apps\desktop\release\win-unpacked\Hermes.exe" set "HERMES_DIR=%GATEWAY_DIR%..\..\hermes-src-grokbuild\apps\desktop\release\win-unpacked"
 if not defined HERMES_DIR if exist "%LOCALAPPDATA%\hermes\hermes-agent\apps\desktop\release\win-unpacked\Hermes.exe" set "HERMES_DIR=%LOCALAPPDATA%\hermes\hermes-agent\apps\desktop\release\win-unpacked"
 if not defined HERMES_DIR if exist "%LOCALAPPDATA%\Programs\Hermes\Hermes.exe" set "HERMES_DIR=%LOCALAPPDATA%\Programs\Hermes"
 set "HERMES_EXE=%HERMES_DIR%\Hermes.exe"

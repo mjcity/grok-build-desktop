@@ -1872,6 +1872,15 @@ function runGrokTurn(
         full = allExhaustedNote();
         emit(session.id, "message.delta", { text: allExhaustedNote() });
       }
+      // This branch returns before the normal "turn end" line below, so a
+      // no-fallback 402 used to leave the log looking like a hung turn
+      // (2026-09-26: "account exhausted" and then nothing). Say what happened.
+      const out = signedOutHomes();
+      log(
+        `turn end session=${session.id.slice(0, 8)} status=error all accounts exhausted` +
+          `${silent ? " (silent/reflection)" : ""}` +
+          (out.length ? ` - signed out, could not fall back to: ${out.join(", ")}` : "")
+      );
       finish(full, "error");
       return;
     }

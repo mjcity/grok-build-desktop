@@ -1,169 +1,54 @@
-diff --git a/apps/desktop/src/app/right-sidebar/terminal/links.test.ts b/apps/desktop/src/app/right-sidebar/terminal/links.test.ts
-index 76b5e4b..88818cc 100644
---- a/apps/desktop/src/app/right-sidebar/terminal/links.test.ts
-+++ b/apps/desktop/src/app/right-sidebar/terminal/links.test.ts
-@@ -43,23 +43,24 @@ async function clickLinkIn(text: string, event: MouseEvent) {
- }
- 
- describe('terminal links', () => {
--  it('opens a ⌘-clicked URL in the in-app browser, not the window.open Electron denies', async () => {
-+  // GROK BUILD PATCH: ⌘-click opens the OS browser, not the in-app pane.
-+  it('opens a ⌘-clicked URL in the OS browser, not the window.open Electron denies', async () => {
-     const uri = 'https://example.com/path'
- 
-     expect(await clickLinkIn(uri, new MouseEvent('click', { metaKey: true }))).toBe(uri)
--    expect(openExternal).not.toHaveBeenCalled()
--    await vi.waitFor(() => expect($previewTabs.get().at(-1)?.target.url).toBe(uri))
-+    expect(openExternal).toHaveBeenCalledWith(uri)
-+    expect($previewTabs.get()).toHaveLength(0)
-   })
- 
-   // The terminal spends ⌘/Ctrl on activation itself, so ⇧ is what escapes to
-   // the OS browser here.
--  it('escapes to the OS browser on ⇧⌘-click', async () => {
-+  it('opens the in-app browser on ⇧⌘-click', async () => {
-     const uri = 'https://example.com/path'
- 
-     await clickLinkIn(uri, new MouseEvent('click', { metaKey: true, shiftKey: true }))
- 
--    expect(openExternal).toHaveBeenCalledWith(uri)
--    expect($previewTabs.get()).toHaveLength(0)
-+    expect(openExternal).not.toHaveBeenCalled()
-+    await vi.waitFor(() => expect($previewTabs.get().at(-1)?.target.url).toBe(uri))
-   })
- 
-   it('leaves a bare click to the selection, so a misclick never launches a browser', async () => {
-@@ -74,7 +75,8 @@ describe('terminal links', () => {
-       start: { x: 1, y: 1 }
-     })
- 
--    await vi.waitFor(() => expect($previewTabs.get().at(-1)?.target.url).toBe('https://example.com/osc8'))
-+    expect(openExternal).toHaveBeenCalledWith('https://example.com/osc8')
-+    expect($previewTabs.get()).toHaveLength(0)
-   })
- })
- 
-diff --git a/apps/desktop/src/app/right-sidebar/terminal/links.ts b/apps/desktop/src/app/right-sidebar/terminal/links.ts
-index cba690f..9f6dcef 100644
---- a/apps/desktop/src/app/right-sidebar/terminal/links.ts
-+++ b/apps/desktop/src/app/right-sidebar/terminal/links.ts
-@@ -25,13 +25,13 @@ export function isTerminalLinkActivation(
- }
- 
- // The terminal spends the ⌘/Ctrl modifier on activation itself, so it has no
--// second chord left to mean "native browser" — ⇧ takes that job here. Elsewhere
--// a bare click opens in-app and ⌘ escapes to the OS; here it's ⌘ to open and
--// ⇧⌘ to escape, which keeps both gestures reachable without stealing the
--// selection back from a plain click.
-+// second chord left to mean "the other browser" — ⇧ takes that job here.
-+// GROK BUILD PATCH: ⌘-click opens the system browser and ⇧⌘ opens the in-app
-+// pane (upstream ships these two swapped), which keeps both gestures reachable
-+// without stealing the selection back from a plain click.
- const activate = (event: MouseEvent, uri: string) => {
-   if (isTerminalLinkActivation(event)) {
--    openLink(uri, { native: event.shiftKey })
-+    openLink(uri, { native: !event.shiftKey })
-   }
- }
- 
-diff --git a/apps/desktop/src/lib/external-link.test.tsx b/apps/desktop/src/lib/external-link.test.tsx
-index 4b4eb25..719d304 100644
---- a/apps/desktop/src/lib/external-link.test.tsx
-+++ b/apps/desktop/src/lib/external-link.test.tsx
-@@ -108,9 +108,9 @@ describe('external link helpers', () => {
-     expect(bridge).toHaveBeenCalledTimes(1)
-   })
- 
--  // A web link belongs in the in-app browser now; the OS browser is the
--  // ⌘/Ctrl-click escape hatch.
--  it('opens a web link in the in-app browser', async () => {
-+  // GROK BUILD PATCH: a web link belongs in the OS browser; the in-app pane is
-+  // the ⌘/Ctrl-click opt-in. (Upstream ships these two swapped.)
-+  it('opens a web link in the OS browser', () => {
-     const openExternal = vi.fn().mockResolvedValue(undefined)
-     installDesktopBridge({ openExternal: openExternal as unknown as Window['hermesDesktop']['openExternal'] })
- 
-@@ -118,13 +118,13 @@ describe('external link helpers', () => {
- 
-     fireEvent.click(screen.getByRole('link', { name: 'Example link' }))
- 
--    expect(openExternal).not.toHaveBeenCalled()
--    await waitFor(() => expect($previewTabs.get().at(-1)?.target.url).toBe('https://example.com/path/to/resource'))
-+    expect(openExternal).toHaveBeenCalledWith('https://example.com/path/to/resource')
-+    expect($previewTabs.get()).toHaveLength(0)
-   })
- 
-   // Platform-specific on purpose (same rule as terminal links / middle-click):
-   // ⌘ on macOS, Ctrl elsewhere. The suite runs as non-mac.
--  it('escapes to the OS browser on the platform open-elsewhere modifier', () => {
-+  it('opens the in-app browser on the platform open-elsewhere modifier', async () => {
-     const openExternal = vi.fn().mockResolvedValue(undefined)
-     installDesktopBridge({ openExternal: openExternal as unknown as Window['hermesDesktop']['openExternal'] })
- 
-@@ -132,8 +132,8 @@ describe('external link helpers', () => {
- 
-     fireEvent.click(screen.getByRole('link', { name: 'Example link' }), IS_MAC ? { metaKey: true } : { ctrlKey: true })
- 
--    expect(openExternal).toHaveBeenCalledWith('https://example.com/path/to/resource')
--    expect($previewTabs.get()).toHaveLength(0)
-+    expect(openExternal).not.toHaveBeenCalled()
-+    await waitFor(() => expect($previewTabs.get().at(-1)?.target.url).toBe('https://example.com/path/to/resource'))
-   })
- 
-   it('treats only the HUD renderer as a native-link surface', () => {
-diff --git a/apps/desktop/src/lib/external-link.tsx b/apps/desktop/src/lib/external-link.tsx
-index 4635323..3fc9e88 100644
---- a/apps/desktop/src/lib/external-link.tsx
-+++ b/apps/desktop/src/lib/external-link.tsx
-@@ -213,12 +213,24 @@ export function openExternalLink(href: string): void {
- }
- 
- /**
-- * True when a click asked for the SYSTEM browser — ⌘ on macOS, Ctrl elsewhere,
-- * the modifier every app uses for "open this somewhere else". Middle-click
-- * counts too: it is the other half of the same convention.
-+ * True when a click asked for the SYSTEM browser.
-+ *
-+ * GROK BUILD PATCH (patches/0001-links-open-in-system-browser.patch). Upstream
-+ * answers "the ⌘/Ctrl modifier or a middle-click" — a bare click goes to the
-+ * in-app pane and the modifier escapes to the OS. Grok Build swaps the roles: a
-+ * BARE click wants the system browser (where the user's logins, extensions and
-+ * tabs already are) and the modifier asks for the pane instead.
-+ *
-+ * The swap lives HERE, in the helper's meaning, not in the call sites: every
-+ * caller written as `openLink(x, { native: wantsNativeBrowser(e) })` — including
-+ * ones upstream adds later — inherits the routing without being patched. (An
-+ * earlier version renamed the helper and the option; the first new upstream
-+ * caller broke the build.)
-  */
- export function wantsNativeBrowser(event: Pick<MouseEvent, 'button' | 'ctrlKey' | 'metaKey'>): boolean {
--  return event.button === 1 || (IS_MAC ? event.metaKey : event.ctrlKey)
-+  const askedForTheOtherSurface = event.button === 1 || (IS_MAC ? event.metaKey : event.ctrlKey)
+diff --git a/apps/desktop/src/store/external-links.grokbuild.test.ts b/apps/desktop/src/store/external-links.grokbuild.test.ts
+new file mode 100644
+index 00000000..a18ec117
+--- /dev/null
++++ b/apps/desktop/src/store/external-links.grokbuild.test.ts
+@@ -0,0 +1,12 @@
++import { describe, expect, it } from 'vitest'
 +
-+  return !askedForTheOtherSurface
++import { $alwaysExternalLinks } from './external-links'
++
++// GROK BUILD PATCH guard: if an upstream update restores the default, this fails
++// loudly instead of links quietly opening in the in-app pane again.
++describe('Grok Build link routing default', () => {
++  it('opens links in the system browser unless the user turned it off', () => {
++    expect($alwaysExternalLinks.get()).toBe(true)
++    expect(document.documentElement.getAttribute('data-link-routing')).toBe('system-first')
++  })
++})
+diff --git a/apps/desktop/src/store/external-links.ts b/apps/desktop/src/store/external-links.ts
+index f22c8c0c..68c52b76 100644
+--- a/apps/desktop/src/store/external-links.ts
++++ b/apps/desktop/src/store/external-links.ts
+@@ -17,18 +17,29 @@ import { persistBoolean, storedBoolean } from '@/lib/storage'
+ 
+ const KEY = 'hermes.desktop.alwaysExternalLinks.v1'
+ 
+-export const $alwaysExternalLinks = atom<boolean>(typeof window === 'undefined' ? false : storedBoolean(KEY, false))
++// GROK BUILD PATCH (patches/0001-links-open-in-system-browser.patch): default ON.
++// A clicked link opens in the system browser - where the user's logins,
++// extensions and tabs are - unless they turn this off in Settings. Upstream
++// defaults it off (bare click -> in-app pane).
++const GROK_BUILD_DEFAULT = true
++
++export const $alwaysExternalLinks = atom<boolean>(
++  typeof window === 'undefined' ? false : storedBoolean(KEY, GROK_BUILD_DEFAULT)
++)
+ 
+ export function setAlwaysExternalLinks(on: boolean): void {
+   $alwaysExternalLinks.set(on)
  }
  
- /**
-@@ -253,8 +265,10 @@ export function openLink(href: string, options: { native?: boolean } = {}): void
-     return
-   }
+ if (typeof window !== 'undefined') {
++  // Marker: a string literal survives minification, so the repair script can
++  // prove this patch is in the INSTALLED bundle, and it is visible in devtools.
++  document.documentElement.setAttribute('data-link-routing', 'system-first')
+   $alwaysExternalLinks.subscribe(on => persistBoolean(KEY, on))
  
-+  // GROK BUILD PATCH: no opinion from the caller means the system browser
-+  // (upstream defaults a bare `openLink(href)` to the in-app pane).
-   if (
--    options.native ||
-+    (options.native ?? true) ||
-     isConnectorAuthorizationLink(target) ||
-     hudForcesNativeLinks() ||
-     !/^https?:$/i.test(parseUrl(target)?.protocol ?? '')
-@@ -319,6 +333,10 @@ export function ExternalLink({
-   return (
-     <a
-       className={cn('ref', className)}
-+      // GROK BUILD PATCH marker. A string literal survives minification, so the
-+      // repair script can prove this patch reached the INSTALLED bundle, and the
-+      // routing is checkable on a live link in devtools.
-+      data-link-routing="system-first"
-       href={target}
-       // Middle-click never fires `click`; it's the other half of the
-       // open-elsewhere convention, so it has to be caught on its own.
+   window.addEventListener('storage', event => {
+     if (event.key === KEY) {
+-      $alwaysExternalLinks.set(storedBoolean(KEY, false))
++      $alwaysExternalLinks.set(storedBoolean(KEY, GROK_BUILD_DEFAULT))
+     }
+   })
+ }

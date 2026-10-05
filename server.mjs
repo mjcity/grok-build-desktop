@@ -798,10 +798,74 @@ function attachedList(session) {
  * is the form Grok was verified to act on.
  */
 function withAttachments(session, text) {
+  const withFiles = expandFileRefs(text);
   const imgs = attachedList(session);
-  if (!imgs.length) return text;
+  if (!imgs.length) return withFiles;
   const lines = imgs.map((f) => f).join("\n");
-  return `${text}\n\n[Attached image${imgs.length > 1 ? "s" : ""} — read the file${imgs.length > 1 ? "s" : ""} at:]\n${lines}`;
+  return `${withFiles}\n\n[Attached image${imgs.length > 1 ? "s" : ""} — read the file${imgs.length > 1 ? "s" : ""} at:]\n${lines}`;
+}
+
+/** The `result` a tool.complete carries: what Grok's event log actually knows. */
+function toolResult(outcome, durationMs) {
+  const out = { outcome: String(outcome || "success") };
+  if (typeof durationMs === "number") out.duration_ms = durationMs;
+  return out;
+}
+
+// ── file.attach support ──────────────────────────────────────────────────────
+/** Quote a ref value the way upstream does, so `@file:` refs round-trip. */
+function formatRefValue(value) {
+  if (!value || !/[\s\[\]()"'`]/.test(value)) return value;
+  for (const q of ["`", '"', "'"]) if (!value.includes(q)) return `${q}${value}${q}`;
+  return value;
+}
+
+/** Resolve a file.attach request to a real file on disk. */
+function stageFileAttachment({ raw, dataUrl, name }) {
+  if (dataUrl) {
+    const m = /^data:[^,]*?;base64,(.*)$/s.exec(dataUrl);
+    if (!m) throw new Error("data_url must be a base64 data: URL");
+    const buf = Buffer.from(m[1], "base64");
+    if (!buf.length) throw new Error("attachment is empty");
+    if (buf.length > ATTACH_MAX_BYTES) {
+      throw new Error(`attachment is ${(buf.length / 1048576).toFixed(1)} MB; the limit is ${ATTACH_MAX_BYTES / 1048576} MB`);
+    }
+    const base = (path.basename(name || raw || "attachment").replace(/[^A-Za-z0-9._ -]/g, "_").slice(-120)) || "attachment";
+    const dir = path.join(attachDir(), "files");
+    fs.mkdirSync(dir, { recursive: true });
+    const target = path.join(dir, `${Date.now().toString(36)}-${base}`);
+    fs.writeFileSync(target, buf);
+    return { path: target, uploaded: true };
+  }
+  const abs = path.resolve(raw);
+  let st;
+  try {
+    st = fs.statSync(abs);
+  } catch {
+    throw new Error(`file not found: ${raw}`);
+  }
+  if (!st.isFile()) throw new Error(`not a file: ${raw}`);
+  return { path: abs, uploaded: false };
+}
+
+/**
+ * The desktop splices `@file:<path>` tokens into the prompt. Hermes's own agent
+ * expands those; Grok has no such syntax, so spell it out: keep the user's text
+ * as typed and append the paths with a plain instruction to read them. The
+ * content is NOT inlined - the prompt travels on grok.exe's command line, and a
+ * large paste there is exactly what used to choke.
+ */
+function expandFileRefs(text) {
+  if (typeof text !== "string" || !text.includes("@file:")) return text;
+  const re = /@file:(?:`([^`]+)`|"([^"]+)"|'([^']+)'|(\S+))/g;
+  const paths = [];
+  let m;
+  while ((m = re.exec(text))) {
+    const p = m[1] || m[2] || m[3] || m[4];
+    if (p && !paths.includes(p)) paths.push(p);
+  }
+  if (!paths.length) return text;
+  return `${text}\n\n[Attached file${paths.length > 1 ? "s" : ""} — read ${paths.length > 1 ? "each one" : "it"} in full before answering:]\n${paths.join("\n")}`;
 }
 
 function grokSkillsDir() {
@@ -1080,7 +1144,13 @@ function sessionInfoPayload(s, running) {
     // desktop. So there is no notification to convert; session.resume reports
     // the truthful empty `open_requests: []`. If a blocking prompt is ever
     // added here it MUST be a server->client request, never a notification.
-    desktop_contract: 7,
+    //   v8 (upstream 2026-10): upstream bumped the number WITHOUT documenting a
+    //   requirement - both its backend comment and the desktop's list stop at
+    //   v7. The only contract-adjacent change found in the diff is that the
+    //   desktop now warns on skew in BOTH directions, so this must equal the
+    //   desktop's REQUIRED_BACKEND_CONTRACT exactly. Claimed on that basis;
+    //   if a real v8 requirement surfaces, revisit this.
+    desktop_contract: 8,
     // Added upstream 2026-08 (arrived under contract 5 — additive, renderer type-guards
     // it). NOT cosmetic: the desktop keys attachment handling off this. Any of
     // CONTAINER_TERMINAL_BACKENDS (docker/ssh/singularity/modal/daytona/
@@ -1417,7 +1487,10 @@ function grokSessionsRoot(cwd, accountHome) {
   return path.join(
     accountHome || path.join(os.homedir(), ".grok"),
     "sessions",
-    encodeURIComponent(cwd || DEFAULT_CWD)
+    // grok names this folder from the NATIVE form of the path (backslashes on
+    // Windows). A caller that sends D:/x/y would otherwise make us tail a
+    // folder that never exists and silently show no tool chips at all.
+    encodeURIComponent(path.resolve(cwd || DEFAULT_CWD))
   );
 }
 
@@ -1508,6 +1581,12 @@ function startToolFeed(session, spawnedAtMs, { silent = false, accountHome = nul
         tool_id: r.tool_id,
         name: r.name,
         duration_ms: rec.duration_ms,
+        // The desktop renders a finished tool row with NO `result` key as an
+        // orange "Result unavailable" (its marker for a lost completion). We
+        // never sent one, so since the 2026-09 desktop every tool Grok ran
+        // looked like a failure. Grok's event log carries only the outcome and
+        // duration - not the tool's output - so report exactly that.
+        result: toolResult(rec.outcome, rec.duration_ms),
       };
       if (rec.outcome && rec.outcome !== "success") {
         payload.error = String(rec.outcome);
@@ -1586,7 +1665,13 @@ function startToolFeed(session, spawnedAtMs, { silent = false, accountHome = nul
       }
       if (!silent) {
         for (const r of running.splice(0)) {
-          emit(session.id, "tool.complete", { tool_id: r.tool_id, name: r.name });
+          // Turn ended before Grok logged this tool's completion: say so,
+          // rather than leaving a row that reads as a lost result.
+          emit(session.id, "tool.complete", {
+            tool_id: r.tool_id,
+            name: r.name,
+            result: toolResult("ended with the turn"),
+          });
         }
       }
     },
@@ -3457,6 +3542,39 @@ wss.on("connection", (ws) => {
               detached: session.attached_images.length !== before,
               count: session.attached_images.length,
             });
+          }
+          // file.attach - non-image attachments, and LARGE PASTES: the desktop
+          // turns a big paste into a temp file and attaches it instead of
+          // putting it in the prompt. Unimplemented, that surfaced as
+          // "Prompt failed / Unknown method: file.attach" and the message never
+          // sent (2026-10-05). Same contract as upstream's handler: reply
+          // { attached, name, path, ref_path, ref_text, uploaded } where
+          // ref_text is the `@file:<path>` token the desktop splices into the
+          // prompt. grok.exe shares this machine's filesystem, so a visible
+          // path is referenced in place; bytes arrive as data_url only when the
+          // desktop decides the path is not backend-visible, and are staged
+          // under our attachments dir. expandFileRefs() tells Grok to read them.
+          if (method === "file.attach") {
+            const session = getSession(params.session_id);
+            if (!session) return err(4001, "session not found");
+            const raw = String(params.path || "").trim();
+            const dataUrl = String(params.data_url || "").trim();
+            const name = String(params.name || "").trim();
+            if (!raw && !dataUrl) return err(4015, "path or data_url required");
+            try {
+              const staged = stageFileAttachment({ raw, dataUrl, name });
+              return ok({
+                attached: true,
+                name: path.basename(staged.path),
+                path: staged.path,
+                ref_path: staged.path,
+                ref_text: `@file:${formatRefValue(staged.path)}`,
+                uploaded: staged.uploaded,
+              });
+            } catch (e) {
+              log(`file.attach failed session=${session.id.slice(0, 8)}: ${e.message}`);
+              return err(5028, String(e.message || e));
+            }
           }
           // Log what we refuse, throttled like the inbound trace. Without this
           // the 2026-08-22 wedge hid for weeks: a method we did not implement

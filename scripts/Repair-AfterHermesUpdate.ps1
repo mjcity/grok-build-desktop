@@ -178,8 +178,11 @@ Invoke-Native 'build-grok-app.mjs' { node $mjs $src $GrokAppDir $ico $png }
 # failure this script exists to prevent.
 Step "Verify patches reached the INSTALLED bundle"
 $assets = Join-Path $GrokAppDir 'resources\app.asar.unpacked\dist\assets'
-$link = Get-ChildItem "$assets\external-link*.js" -ErrorAction SilentlyContinue
-if (-not $link) { Fail "no external-link chunk under $assets" }
+# The marker can land in any chunk (it lives in a small store module the bundler
+# places where it likes), so search every script asset, not one filename.
+$link = Get-ChildItem "$assets\*.js" -ErrorAction SilentlyContinue |
+  Where-Object { Select-String -Path $_.FullName -Pattern 'system-first' -Quiet } | Select-Object -First 1
+if (-not $link) { Fail "link patch marker 'system-first' is in no script under $assets" }
 # Marker = the data-link-routing="system-first" attribute the patch puts on link
 # anchors. It is a string literal, so it survives minification; the patch's
 # actual logic (an inverted helper) leaves nothing greppable behind.

@@ -267,15 +267,20 @@ if (fs.existsSync(mainMjs)) {
   // Grok Build onto stock Hermes's taskbar button, undoing the whole identity
   // layer while every log line still said success. Capture whatever receiver
   // the bundle uses and reuse it for the injected title-lock too.
-  const aumidRe = /([A-Za-z_$][\w$]*)\.setAppUserModelId\("com\.nousresearch\.hermes"\)/;
+  //
+  // 2026-10-05: the ARGUMENT drifted too. Upstream now writes
+  //   app9.setAppUserModelId(IDENTITY_APP_NAME ? PRODUCT_IDENTITY.appId : "com.nousresearch.hermes");
+  // so matching the literal argument missed (the exit-4 gate below caught it
+  // and refused to ship). Match the CALL, whatever expression it is passed, and
+  // replace the whole argument with our id. Idempotent: a call already carrying
+  // our id is recognised and left alone.
+  const aumidRe = /([A-Za-z_$][\w$]*)\.setAppUserModelId\(([^;\n]*)\);/;
   const aumidMatch = src.match(aumidRe);
   const titleHits = src.split('title: "Hermes"').length - 1;
   if (aumidMatch || titleHits > 0) {
     const appVar = aumidMatch ? aumidMatch[1] : "app";
-    if (aumidMatch) {
-      src = src
-        .split(appVar + '.setAppUserModelId("com.nousresearch.hermes")')
-        .join(appVar + '.setAppUserModelId("com.mjcity.grokbuild")');
+    if (aumidMatch && aumidMatch[2] !== '"com.mjcity.grokbuild"') {
+      src = src.replace(aumidMatch[0], appVar + '.setAppUserModelId("com.mjcity.grokbuild");');
     }
     src = src.split('title: "Hermes"').join('title: "Grok Build"');
     // The BrowserWindow `title:` option alone is not enough: once the

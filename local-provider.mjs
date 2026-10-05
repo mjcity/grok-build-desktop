@@ -324,7 +324,7 @@ export function mapAcpUpdate(update, state, sessionId) {
     out.push({ type: "tool.start", payload: { tool_id: rec.tool_id, name } });
     if (update.status === "completed" || update.status === "failed") {
       rec.done = true;
-      const payload = { tool_id: rec.tool_id, name, duration_ms: 0 };
+      const payload = { tool_id: rec.tool_id, name, duration_ms: 0, result: { outcome: update.status } };
       if (update.status === "failed") payload.error = "failed";
       out.push({ type: "tool.complete", payload });
     }
@@ -340,7 +340,7 @@ export function mapAcpUpdate(update, state, sessionId) {
     if (update.title && !rec.done) rec.name = String(update.title).slice(0, 120);
     if ((update.status === "completed" || update.status === "failed") && !rec.done) {
       rec.done = true;
-      const payload = { tool_id: rec.tool_id, name: rec.name, duration_ms: Date.now() - rec.startedAt };
+      const payload = { tool_id: rec.tool_id, name: rec.name, duration_ms: Date.now() - rec.startedAt, result: { outcome: update.status } };
       if (update.status === "failed") payload.error = "failed";
       out.push({ type: "tool.complete", payload });
     }
@@ -357,7 +357,7 @@ export function settleOpenTools(state, error) {
   for (const rec of state.tools.values()) {
     if (rec.done) continue;
     rec.done = true;
-    const payload = { tool_id: rec.tool_id, name: rec.name, duration_ms: Date.now() - rec.startedAt };
+    const payload = { tool_id: rec.tool_id, name: rec.name, duration_ms: Date.now() - rec.startedAt, result: { outcome: error ? "failed" : "ended with the turn" } };
     if (error) payload.error = error;
     out.push({ type: "tool.complete", payload });
   }

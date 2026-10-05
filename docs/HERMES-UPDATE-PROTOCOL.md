@@ -122,8 +122,7 @@ the patch survived.
 | `acp_adapter/session.py` | Buzz ACP compatibility — **needs rework**, see below | `patches/0002-buzz-acp-compat.patch.needs-rework` |
 | `tools/environments/local.py` | Buzz ACP compatibility | `patches/0002-buzz-acp-compat.patch` |
 | `tools/tool_search.py` | Buzz ACP compatibility — **needs rework** | `_NEVER_DEFER_TOOL_NAMES` |
-| `apps/desktop/src/lib/external-link.tsx` | A bare click on a chat link opens the **system** browser; the in-app preview pane moves to ⌘/Ctrl-click and middle-click. Upstream shipped these swapped in `d07be6e1`. | `system-first` (data attribute on link anchors) |
-| `apps/desktop/src/app/right-sidebar/terminal/links.ts` | Same swap for terminal links: ⌘/Ctrl-click → system browser, ⇧⌘ → in-app pane. | `native: !event.shiftKey` |
+| `apps/desktop/src/store/external-links.ts` | Upstream's own "Always open links in external browser" setting, defaulted ON (since 2026-10-05; replaces the old link-routing rewrite). A bare click opens the system browser; the user can turn it off in Settings. A guard test ships in the patch. | `system-first` (attribute set on `<html>`; search every asset chunk) |
 
 > **Buzz patches parked at `13f4cfeb` (2026-08-22).** All three conflict with
 > upstream's rewrite of those files, and none of the changes were adopted

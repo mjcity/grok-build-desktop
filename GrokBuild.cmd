@@ -309,6 +309,21 @@ if exist "%ICON_PATH%" (
 :skip_rebrand
 
 rem --- 3) launch Hermes wired to the gateway ---
+rem Give the desktop shell its OWN Hermes home. Found 2026-10-06: the shell
+rem resolves HERMES_HOME from the Windows USER environment variable, which on
+rem this machine points at ORIGINAL Hermes's folder (%LOCALAPPDATA%\hermes).
+rem Grok Build was therefore reading original Hermes's config.yaml, profiles and
+rem active_profile, and writing its desktop.log and update receipts into
+rem original Hermes's logs - the two apps were tied together after all, and a
+rem settings change in one showed up in both. HERMES_DESKTOP_USER_DATA_DIR alone
+rem does not help: an explicit HERMES_HOME wins over it. On first use the new
+rem home is seeded with a COPY of the current config.yaml so appearance and
+rem desktop settings carry over; original Hermes's file is only read.
+set "GROK_HERMES_HOME=%PROFILE_DIR%\hermes-home"
+if not exist "%GROK_HERMES_HOME%" mkdir "%GROK_HERMES_HOME%"
+if not exist "%GROK_HERMES_HOME%\config.yaml" if exist "%LOCALAPPDATA%\hermes\config.yaml" copy /y "%LOCALAPPDATA%\hermes\config.yaml" "%GROK_HERMES_HOME%\config.yaml" >nul
+set "HERMES_HOME=%GROK_HERMES_HOME%"
+echo %date% %time% launcher: desktop HERMES_HOME=%GROK_HERMES_HOME% >> "%BOOT_LOG%"
 set "HERMES_DESKTOP_REMOTE_URL=%GW_URL%"
 set "HERMES_DESKTOP_REMOTE_TOKEN=%GROK_BUILD_TOKEN%"
 set "HERMES_DESKTOP_USER_DATA_DIR=%PROFILE_DIR%"

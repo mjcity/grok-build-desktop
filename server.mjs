@@ -232,7 +232,12 @@ function effectiveGrokModel(want) {
 // auto-expires after ACCOUNT_RETRY_AFTER_MS so the primary returns after its
 // weekly reset, and a gateway restart clears markers (in-memory only) for a
 // free re-probe — a 402 costs nothing since the balance is already spent.
-const EXHAUSTION_RE = /402|payment required|usage balance exhausted|balance exhausted/i;
+// The CLI words an out-of-allowance account in more than one way: the
+// weekly-balance 402 AND (seen 2026-10-25, when an account's SuperGrok showed
+// as free) "You've reached your free Grok Build usage limit for now". The
+// second has no 402 in it, so a 402-only match never fell back to the other
+// account. Both mean "this account can't serve a turn right now".
+const EXHAUSTION_RE = /402|payment required|usage balance exhausted|balance exhausted|reached your [^.]{0,40}usage limit|usage limit for now/i;
 // How long an exhausted account stays skipped before we spend a spawn checking
 // it again. This is a RETRY interval, not a guess at when the weekly balance
 // resets - we cannot know that, and guessing it wrong strands a live account.

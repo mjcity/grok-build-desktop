@@ -23,7 +23,7 @@
  */
 
 import http from "node:http";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -45,7 +45,15 @@ const DATA =
   process.env.GROK_GATEWAY_HOME ||
   path.join(os.homedir(), ".grok-hermes-desktop");
 const LOGS = path.join(DATA, "logs");
-const MODEL = process.env.GROK_GATEWAY_MODEL || "grok-4.6";
+// The Grok model the gateway asks for. NOT a constant any more: xAI retires
+// model names (grok-4.6 vanished 2026-10; the account now offers only
+// grok-4.7), and a retired name makes grok.exe reject EVERY message with
+// "Couldn't set model ... unknown model id" before it ever looks at balance -
+// which read as "the fallback didn't work" because no account could answer.
+// The starting value is only a guess until refreshGrokModels() (below) asks the
+// CLI what the signed-in account really offers; GROK_GATEWAY_MODEL pins it.
+const MODEL_PINNED = !!process.env.GROK_GATEWAY_MODEL;
+let MODEL = process.env.GROK_GATEWAY_MODEL || "grok-4.7";
 const REASONING_EFFORT =
   process.env.GROK_GATEWAY_REASONING_EFFORT || "medium";
 const PROVIDER = "grok-cli";
@@ -142,6 +150,72 @@ function findGrok() {
     if (c && fs.existsSync(c)) return c;
   }
   return "grok";
+}
+
+// ── Which Grok models exist right now ─────────────────────────────────────
+// `grok models` prints "Default model: X" and an "Available models:" list. We
+// cache it, map any model name a chat remembers that is no longer offered to
+// the account default, and re-read it whenever grok says "unknown model id".
+const grokModelState = { list: [], def: null, at: 0, inflight: null };
+
+function parseGrokModels(text) {
+  const out = { list: [], def: null };
+  const d = /Default model:\s*([^\s]+)/i.exec(text);
+  if (d) out.def = d[1];
+  let inList = false;
+  for (const line of String(text).split(/\r?\n/)) {
+    if (/^\s*Available models:/i.test(line)) {
+      inList = true;
+      continue;
+    }
+    if (!inList) continue;
+    const m = /^\s*\*?\s*([A-Za-z0-9][\w.\-:/]*)/.exec(line);
+    if (m) out.list.push(m[1]);
+  }
+  if (out.def && !out.list.includes(out.def)) out.list.unshift(out.def);
+  return out;
+}
+
+/** Re-read the account's model list; resolves when done. Never throws. */
+function refreshGrokModels() {
+  if (grokModelState.inflight) return grokModelState.inflight;
+  grokModelState.inflight = new Promise((resolve) => {
+    execFile(
+      findGrok(),
+      ["models"],
+      { timeout: 30_000, windowsHide: true, encoding: "utf8" },
+      (error, stdout) => {
+        try {
+          const parsed = parseGrokModels(stdout || "");
+          if (parsed.list.length) {
+            const was = MODEL;
+            grokModelState.list = parsed.list;
+            grokModelState.def = parsed.def || parsed.list[0];
+            grokModelState.at = Date.now();
+            if (!MODEL_PINNED || !parsed.list.includes(MODEL)) MODEL = grokModelState.def;
+            log(`grok models: [${parsed.list.join(", ")}] default=${grokModelState.def}${was !== MODEL ? ` (gateway model ${was} -> ${MODEL})` : ""}`);
+            healStoredGrokModels();
+          } else {
+            log(`grok models: could not read the list (${error ? error.message : "empty output"}); keeping ${MODEL}`);
+          }
+        } catch (e) {
+          log(`grok models: ${e.message}`);
+        }
+        grokModelState.inflight = null;
+        resolve(grokModelState.list);
+      }
+    );
+  });
+  return grokModelState.inflight;
+}
+
+/** The model to actually pass to grok: the chat's, unless it was retired. */
+function effectiveGrokModel(want) {
+  const w = want || MODEL;
+  if (grokModelState.list.length && !grokModelState.list.includes(w)) {
+    return grokModelState.def || grokModelState.list[0];
+  }
+  return w;
 }
 
 // ── Multi-account weekly-balance fallback ─────────────────────────────────
@@ -606,6 +680,29 @@ function upsertSession(session) {
   else data.sessions.unshift(session);
   saveStore(data);
   return session;
+}
+
+/**
+ * Chats remember the model they were created with. When xAI retires a name,
+ * every one of those chats would keep sending it (119 chats were on grok-4.6).
+ * Move Grok chats whose model is no longer offered onto the account default;
+ * Frozen Local chats carry a local model id and are left alone.
+ */
+function healStoredGrokModels() {
+  if (!grokModelState.list.length) return;
+  const data = loadStore();
+  let n = 0;
+  for (const s of data.sessions) {
+    if (s.provider === LOCAL_SLUG) continue;
+    if (s.model && !grokModelState.list.includes(s.model)) {
+      s.model = grokModelState.def || grokModelState.list[0];
+      n++;
+    }
+  }
+  if (n) {
+    saveStore(data);
+    log(`grok models: moved ${n} chat(s) off a retired model onto ${grokModelState.def}`);
+  }
 }
 
 function createSession(partial = {}) {
@@ -1093,10 +1190,12 @@ function modelOptionsPayload(session, inv) {
         auth_type: "cli",
         key_env: null,
         warning: null,
-        models: [MODEL],
-        total_models: 1,
+        models: grokModelState.list.length ? grokModelState.list : [MODEL],
+        total_models: grokModelState.list.length || 1,
         pricing: {},
-        capabilities: { [MODEL]: { fast: false, reasoning: true } },
+        capabilities: Object.fromEntries(
+          (grokModelState.list.length ? grokModelState.list : [MODEL]).map((m) => [m, { fast: false, reasoning: true }])
+        ),
       },
       frozenRow,
     ],
@@ -1684,7 +1783,7 @@ function startToolFeed(session, spawnedAtMs, { silent = false, accountHome = nul
 function runGrokTurn(
   session,
   text,
-  { silent = false, accountHome = null, retryCount = 0, resumeRetried = false } = {}
+  { silent = false, accountHome = null, retryCount = 0, resumeRetried = false, modelRetried = false } = {}
 ) {
   // Resolve which account (config home) this turn runs on. accountHome is set
   // only when we're retrying after a 402 fallback; otherwise pick the active
@@ -1729,7 +1828,7 @@ function runGrokTurn(
     // for Tier 2 (the part that DOES need gateway logic).
     "--experimental-memory",
     "-m",
-    session.model || MODEL,
+    effectiveGrokModel(session.model),
     "--reasoning-effort",
     REASONING_EFFORT,
     "--cwd",
@@ -2009,6 +2108,33 @@ function runGrokTurn(
         accountHome: home,
         retryCount,
         resumeRetried: true,
+      });
+      return; // the retried turn owns finishing
+    }
+
+    // grok refused the MODEL NAME ("Couldn't set model 'x': unknown model id").
+    // That is not a balance problem, so the account fallback above never sees
+    // it - which is how a retired name made every account look broken. Re-read
+    // what the account offers, move this chat onto the default, and run the
+    // same message once more. Once only: if the default is refused too, the
+    // real error should reach the user, not loop.
+    if (
+      !full &&
+      code !== 0 &&
+      !cancelled &&
+      !autoKillReason &&
+      !modelRetried &&
+      /unknown model id|couldn'?t set model/i.test(stderr)
+    ) {
+      const stale = session.model;
+      refreshGrokModels().then(() => {
+        const next = grokModelState.def || MODEL;
+        log(`model retry session=${session.id.slice(0, 8)}: ${stale || "(default)"} refused -> ${next}`);
+        session.model = next;
+        upsertSession(session);
+        toolFeed.stop();
+        if (!silent) clearTurnKeepalive(session.id);
+        runGrokTurn(session, text, { silent, accountHome: home, retryCount, resumeRetried, modelRetried: true });
       });
       return; // the retried turn owns finishing
     }
@@ -2365,7 +2491,7 @@ function runOneshot(instructions, input, cb) {
     "json",
     "--no-auto-update",
     "-m",
-    MODEL,
+    effectiveGrokModel(),
     "--reasoning-effort",
     REASONING_EFFORT,
     "--cwd",
@@ -3685,6 +3811,8 @@ wsKeepalive.unref?.();
 
 server.listen(PORT, HOST, () => {
   log(`grok-gateway v2 listening on http://${HOST}:${PORT}`);
+  // Learn which Grok models the account offers NOW (and move chats off retired ones).
+  void refreshGrokModels();
   // Say the account roster out loud at every start. A signed-out fallback
   // account is invisible at runtime (it is simply never picked), so this line
   // is where "you are running on ONE account" gets noticed.

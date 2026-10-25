@@ -32,7 +32,7 @@ rem ============================================================
 
 if not defined GROK_BUILD_PORT set "GROK_BUILD_PORT=8787"
 if not defined GROK_BUILD_TOKEN set "GROK_BUILD_TOKEN=local-grok-dev-token"
-if not defined GROK_GATEWAY_MODEL set "GROK_GATEWAY_MODEL=grok-4.6"
+if not defined GROK_GATEWAY_MODEL set "GROK_GATEWAY_MODEL=grok-4.7"
 if not defined GROK_GATEWAY_REASONING_EFFORT set "GROK_GATEWAY_REASONING_EFFORT=medium"
 set "GW_URL=http://127.0.0.1:%GROK_BUILD_PORT%"
 
